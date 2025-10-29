@@ -1,0 +1,26 @@
+model:
+  type: PESpatialEncoder
+  config:
+    embed_dim: 256
+    hidden_dim: 128
+    position_composition_method: "max"
+    project_positional_embeddings: True
+
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size: [256, 256, 3]
+      shapes: ["circle", "square"]
+      colors: [(255, 0, 0), (0, 0, 255)]
+      num_samples: 1000
+    dataloader_config:
+      batch_size: 256
+      shuffle: True
+
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 1e-4
