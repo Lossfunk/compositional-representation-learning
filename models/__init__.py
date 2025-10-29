@@ -1,1 +1,3 @@
 from .ImageEncoder import ImageEncoder
+from .PositionalEncoder import PositionalEncoder
+from .PermutationInvariantEncoder import PermutationInvariantEncoder
