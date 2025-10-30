@@ -13,6 +13,10 @@ class v0Dataset(Dataset):
         self.image_size = config['image_size']
         self.shapes = config['shapes']
         self.colors = config['colors']
+        self.color_map = {
+            "red": (255, 0, 0),
+            "blue": (0, 0, 255)
+        }
 
         self.num_samples = config['num_samples']
 
@@ -26,15 +30,19 @@ class v0Dataset(Dataset):
     def __getitem__(self, idx):
         image, mask = self.generate_image()
         image = self.transform(image)
-        mask = self.transform(mask)
-        return image, mask
+        mask = self.transform(mask).squeeze(0)
+        
+        return {
+            "images": image,
+            "object_masks": mask
+        }
 
     def generate_image(self):
         image = np.zeros(self.image_size, dtype=np.uint8)
         mask = np.zeros(self.image_size[0:2], dtype=np.uint8)
         
         shape = random.choice(self.shapes)
-        color = random.choice(self.colors)
+        color = self.color_map[random.choice(self.colors)]
         
         if shape == "circle":
             radius = np.random.randint(10, 50)

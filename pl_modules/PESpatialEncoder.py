@@ -10,10 +10,10 @@ class PESpatialEncoder(L.LightningModule):
         super().__init__()
 
         self.config = config
-        self.embed_dim = config['embed_dim']
-        self.hidden_dim = config['hidden_dim']
-        self.position_composition_method = config['position_composition_method']
-        self.project_positional_embeddings = config['project_positional_embeddings']
+        self.embed_dim = config['model']['config']['embed_dim']
+        self.hidden_dim = config['model']['config']['hidden_dim']
+        self.position_composition_method = config['model']['config']['position_composition_method']
+        self.project_positional_embeddings = config['model']['config']['project_positional_embeddings']
 
         self.image_encoder = ImageEncoder(embed_dim = self.embed_dim)
         self.positional_encoder = PositionalEncoder(embed_dim = self.embed_dim)
@@ -34,11 +34,12 @@ class PESpatialEncoder(L.LightningModule):
         for datapoint_idx in range(batch_size):
             object_mask_img = object_masks[datapoint_idx].unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
             object_mask_featmap = F.interpolate(object_mask_img, scale_factor = (scale_factor_y, scale_factor_x), mode = 'nearest') # (1, 1, H, W)
+            object_mask_featmap = object_mask_featmap.squeeze(0).squeeze(0) # (H, W)
             
             object_coordinates_featmap = (object_mask_featmap >= 0.5).nonzero(as_tuple=False) # (N, 2)
             object_coordinates_y_min = object_coordinates_featmap[:, 0].min()
             object_coordinates_x_min = object_coordinates_featmap[:, 1].min()
-            object_coordinates_top_left = torch.stack([object_coordinates_y_min, object_coordinates_x_min], dim=1) # (1, 2)
+            object_coordinates_top_left = torch.stack([object_coordinates_y_min, object_coordinates_x_min]).unsqueeze(0) # (1, 2)
             object_coordinates_relative = object_coordinates_featmap - object_coordinates_top_left # (N, 2)
 
             object_positional_embeddings = self.positional_encoder(object_coordinates_relative.unsqueeze(0).float()) # (1, N, embed_dim)
@@ -73,6 +74,13 @@ class PESpatialEncoder(L.LightningModule):
         self.log('train_loss', loss, prog_bar=True, on_epoch=True)
 
         return loss
+
+    def configure_optimizers(self):
+
+        if self.config['trainer']['optimizer']['type'] == 'Adam':
+            return torch.optim.Adam(self.parameters(), **self.config['trainer']['optimizer']['config'])
+        else:
+            raise ValueError(f"Optimizer type {self.config['trainer']['optimizer']['type']} not implemented.")
 
     def project_to_negative_hypersphere(self, embeddings, eps = 1e-8):
 
