@@ -195,6 +195,9 @@ class PatchBoxEmbeddings(L.LightningModule):
             num_patches = bbox_grid_h * bbox_grid_w
             object_patches_flattened = object_patches.reshape(num_patches, C, patch_h, patch_w) # (num_patches, C, patch_h, patch_w)
 
+            if num_patches <= 2:
+                continue
+
             object_patches_resized = F.interpolate(object_patches_flattened, size = (224, 224), mode = "bilinear", align_corners = False) # (num_patches, C, 224, 224)
             object_region_resized = F.interpolate(object_region.unsqueeze(0), size = (224, 224), mode = "bilinear", align_corners = False) # (1, C, 224, 224)
             encoder_output = self.image_encoder(torch.cat([object_patches_resized, object_region_resized], dim = 0)) # (num_patches + 1, box_embed_dim)
@@ -241,21 +244,22 @@ class PatchBoxEmbeddings(L.LightningModule):
                 sampled_permutation_intersection_boxes,
                 overall_intersection_box.expand_as(sampled_permutation_intersection_boxes)
             ) # (num_permutation_sets,)
+            parent_permutation_inclusion_loss = parent_permutation_inclusion_loss.mean()
 
             parent_permutation_pairwise_intersection_boxes = self.compute_pairwise_intersection_boxes(sampled_permutation_intersection_boxes, sampled_permutation_intersection_boxes) # (num_permutation_sets, num_permutation_sets, box_embed_dim)
             parent_permutation_pairwise_volumes = self.compute_box_volume(parent_permutation_pairwise_intersection_boxes.reshape(-1, self.box_embed_dim)) # (num_permutation_sets * num_permutation_sets,)
             parent_permutation_pairwise_volumes = parent_permutation_pairwise_volumes.reshape(num_permutation_sets, num_permutation_sets) # (num_permutation_sets, num_permutation_sets)
             parent_permutation_pairwise_volumes_upper = parent_permutation_pairwise_volumes.triu(diagonal=1)
-            parent_permutation_separation_loss = torch.sum(parent_permutation_pairwise_volumes_upper) / (num_permutation_sets * (num_permutation_sets - 1)) # scalar
+            parent_permutation_separation_loss = torch.sum(parent_permutation_pairwise_volumes_upper) / (num_permutation_sets * (num_permutation_sets - 1) + 1e-6) # scalar
 
-            correct_parent_set = torch.diagonal(parent_embeddings, 0) # (num_patches, box_embed_dim)
+            correct_parent_set = torch.diagonal(parent_embeddings, 0).permute(1, 0) # (num_patches, box_embed_dim)
             correct_parent_intersection_box = self.compute_overall_intersection_box(correct_parent_set) # (1, box_embed_dim)
             object_region_alignment_loss = F.mse_loss(quantized_object_region_embedding, correct_parent_intersection_box) # scalar
 
-            batch_loss_tensors["pos_commitment_loss"] += positional_commitment_loss
-            batch_loss_tensors["patch_commitment_loss"] += patch_commitment_loss
-            batch_loss_tensors["object_region_commitment_loss"] += region_commitment_loss
-            batch_loss_tensors["parent_commitment_loss"] += parent_commitment_loss
+            batch_loss_tensors["pos_commitment_loss"] += positional_commitment_loss.mean()
+            batch_loss_tensors["patch_commitment_loss"] += patch_commitment_loss.mean()
+            batch_loss_tensors["object_region_commitment_loss"] += region_commitment_loss.mean()
+            batch_loss_tensors["parent_commitment_loss"] += parent_commitment_loss.mean()
             batch_loss_tensors["foundational_embeddings_separation_loss"] += foundational_embeddings_separation_loss
             batch_loss_tensors["parent_inclusion_loss"] += parent_inclusion_loss
             batch_loss_tensors["parent_permutation_inclusion_loss"] += parent_permutation_inclusion_loss
@@ -278,6 +282,12 @@ class PatchBoxEmbeddings(L.LightningModule):
             return torch.optim.Adam(self.parameters(), **self.config['trainer']['optimizer']['config'])
         else:
             raise ValueError(f"Optimizer type {self.config['trainer']['optimizer']['type']} not implemented.")
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        with torch.no_grad():
+            min_embed, max_embed = self.split_box_embeddings(self.vq.codebook)
+            clamped_max = torch.max(max_embed, min_embed + 1e-4)
+            self.vq.codebook.data[:, self.embed_dim:] = clamped_max
 
     def divide_image_into_patches(self, images):
         B, C, H, W = images.shape
@@ -378,10 +388,11 @@ class PatchBoxEmbeddings(L.LightningModule):
 
     def compute_box_volume(self, box_embeddings):
         boxes_min, boxes_max = self.split_box_embeddings(box_embeddings) # (N, embed_dim), (N, embed_dim)
-        box_sizes = boxes_max - boxes_min # (N, embed_dim)
-        box_volume = torch.prod(box_sizes, dim=-1) # (N,)
+        box_sizes = torch.clamp(boxes_max - boxes_min, min = 0) # (N, embed_dim)
+        # box_volume = torch.prod(box_sizes, dim=-1) # (N,)
+        log_volume = torch.sum(torch.log(box_sizes + 1e-6), dim=-1) # (N,)
         
-        return box_volume
+        return log_volume
 
     def compute_positive_volume_loss(self, box_embeddings, min_side = 0.1):
         num_boxes = box_embeddings.shape[0]
@@ -415,15 +426,39 @@ class PatchBoxEmbeddings(L.LightningModule):
 
         return indices
 
+    # def compute_foundational_embeddings_loss(self, quantized_patch_embeddings, quantized_positional_embeddings):
+    #     unique_quantized_patch_embeddings, _ = torch.unique(quantized_patch_embeddings, dim=0, return_inverse=True) # (num_unique, box_embed_dim), (N)
+    #     foundational_embeddings = torch.cat([quantized_positional_embeddings, unique_quantized_patch_embeddings], dim = 0) # (N + num_unique, box_embed_dim)
+    #     foundational_embeddings_min, foundational_embeddings_max = self.split_box_embeddings(foundational_embeddings) # (N + num_unique, embed_dim), (N + num_unique, embed_dim)
+    #     foundational_embeddings_centers = (foundational_embeddings_min + foundational_embeddings_max) / 2.0 # (N + num_unique, embed_dim)
+    #     foundational_embeddings_distance_margin = 0.1
+    #     foundational_embeddings_pairwise_distances = torch.pdist(foundational_embeddings_centers, p=2) # (N + num_unique, N + num_unique)
+    #     foundational_embeddings_separation_loss = F.relu(foundational_embeddings_distance_margin - foundational_embeddings_pairwise_distances) # (N + num_unique, N + num_unique)
+    #     foundational_embeddings_separation_loss = torch.sum(foundational_embeddings_separation_loss) / (foundational_embeddings_centers.shape[0] * (foundational_embeddings_centers.shape[0] - 1)) # scalar
+
+    #     return foundational_embeddings_separation_loss
+
     def compute_foundational_embeddings_loss(self, quantized_patch_embeddings, quantized_positional_embeddings):
-        unique_quantized_patch_embeddings, _ = torch.unique(quantized_patch_embeddings, dim=0, return_inverse=True) # (num_unique, box_embed_dim), (N)
-        foundational_embeddings = torch.cat([quantized_positional_embeddings, unique_quantized_patch_embeddings], dim = 0) # (N + num_unique, box_embed_dim)
+        N, M = quantized_positional_embeddings.shape[0], quantized_patch_embeddings.shape[0]
+        foundational_embeddings = torch.cat([quantized_positional_embeddings, quantized_patch_embeddings], dim = 0) # (N + num_unique, box_embed_dim)
         foundational_embeddings_min, foundational_embeddings_max = self.split_box_embeddings(foundational_embeddings) # (N + num_unique, embed_dim), (N + num_unique, embed_dim)
         foundational_embeddings_centers = (foundational_embeddings_min + foundational_embeddings_max) / 2.0 # (N + num_unique, embed_dim)
+        
         foundational_embeddings_distance_margin = 0.1
-        foundational_embeddings_pairwise_distances = torch.pdist(foundational_embeddings_centers, p=2) # (N + num_unique, N + num_unique)
+        foundational_embeddings_pairwise_distances = torch.cdist(foundational_embeddings_centers, foundational_embeddings_centers, p=2) # (N + num_unique, N + num_unique)
         foundational_embeddings_separation_loss = F.relu(foundational_embeddings_distance_margin - foundational_embeddings_pairwise_distances) # (N + num_unique, N + num_unique)
-        foundational_embeddings_separation_loss = torch.sum(foundational_embeddings_separation_loss) / (foundational_embeddings_centers.shape[0] * (foundational_embeddings_centers.shape[0] - 1)) # scalar
+        
+        mask = torch.ones_like(foundational_embeddings_pairwise_distances, dtype=torch.bool)
+        mask.fill_diagonal_(False)
+        patch_eq_matrix = torch.all(
+            quantized_patch_embeddings.unsqueeze(1) == quantized_patch_embeddings.unsqueeze(0),
+            dim=-1
+        ) 
+        mask[N:, N:] = ~patch_eq_matrix
+        mask = mask.float()
+
+        foundational_embeddings_separation_loss = foundational_embeddings_separation_loss * mask
+        foundational_embeddings_separation_loss = foundational_embeddings_separation_loss.sum() / (mask.sum() + 1e-6)
 
         return foundational_embeddings_separation_loss
 

@@ -60,7 +60,8 @@ if __name__ == "__main__":
         default_root_dir=experiment_dir,
         logger=wandb_logger,
         log_every_n_steps=10,
-        callbacks=[model_checkpoint]
+        callbacks=[model_checkpoint],
+        gradient_clip_val=1.0
     )
 
     trainer.fit(pl_module, train_dataloaders=train_dataloader)
