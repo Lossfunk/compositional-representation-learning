@@ -1,4 +1,6 @@
+import math
 import itertools
+import random
 
 import torch
 from torch import nn
@@ -46,7 +48,7 @@ class ImageEncoder(nn.Module):
 
         self.flatten = nn.Flatten()
         self.mlp = nn.Sequential(
-            nn.Linear(96 * 4 * 4, 256),
+            nn.Linear(96 * 3 * 3, 256),
             nn.ReLU(),
             nn.Linear(256, embed_dim)
         )
@@ -133,12 +135,13 @@ class PatchBoxEmbeddings(L.LightningModule):
         super().__init__()
 
         self.config = config
-        self.embed_dim = config['embed_dim']
+        self.embed_dim = config['model']['config']['embed_dim']
         self.box_embed_dim = self.embed_dim * 2
-        self.hidden_dim = config['hidden_dim']
-        self.grid_size = config['grid_size']
+        self.hidden_dim = config['model']['config']['hidden_dim']
+        self.grid_size = config['model']['config']['grid_size']
+        self.permutation_samples = 5
 
-        self.image_encoder = ImageEncoder(embed_dim = self.embed_dim)
+        self.image_encoder = ImageEncoder(embed_dim = self.box_embed_dim)
         self.positional_encoder = PositionalEncoder(input_dim = 2, output_dim = self.box_embed_dim, hidden_dim = self.hidden_dim)
         self.binding_function = BindingFunction(input_dim = self.box_embed_dim * 2, output_dim = self.box_embed_dim, hidden_dim = self.hidden_dim)
 
@@ -169,7 +172,7 @@ class PatchBoxEmbeddings(L.LightningModule):
             "patch_commitment_loss": torch.tensor(0.0, device = images.device),
             "object_region_commitment_loss": torch.tensor(0.0, device = images.device),
             "parent_commitment_loss": torch.tensor(0.0, device = images.device),
-            "fundamental_embeddings_separation_loss": torch.tensor(0.0, device = images.device),
+            "foundational_embeddings_separation_loss": torch.tensor(0.0, device = images.device),
             "parent_inclusion_loss": torch.tensor(0.0, device = images.device),
             "parent_permutation_inclusion_loss": torch.tensor(0.0, device = images.device),
             "parent_permutation_separation_loss": torch.tensor(0.0, device = images.device),
@@ -185,76 +188,75 @@ class PatchBoxEmbeddings(L.LightningModule):
             mask_patches = batch_mask_patches[datapoint_idx] # (grid_h, grid_w, 1, patch_h, patch_w)
             bounding_box = batch_bounding_boxes[datapoint_idx] # (4,)
 
+            # Get the patches that contain the object
             object_patches = image_patches[bounding_box[0]:bounding_box[2] + 1, bounding_box[1]:bounding_box[3] + 1] # (bbox_grid_h, bbox_grid_w, C, patch_h, patch_w)
+            object_region = self.stitch_object_patches(object_patches) # (C, stitched_h, stitched_w)
             bbox_grid_h, bbox_grid_w, C, patch_h, patch_w = object_patches.shape
             num_patches = bbox_grid_h * bbox_grid_w
-            object_patches_flattened = object_patches.view(num_patches, C, patch_h, patch_w) # (num_patches, C, patch_h, patch_w)
-            object_region = self.stitch_object_patches(object_patches) # (C, stitched_h, stitched_w)
+            object_patches_flattened = object_patches.reshape(num_patches, C, patch_h, patch_w) # (num_patches, C, patch_h, patch_w)
 
-            object_patches_resized = F.interpolate(object_patches_flattened, size = (224, 224), mode = "bilinear", align_corners = False) # (bbox_grid_h * bbox_grid_w, C, 224, 224)
+            object_patches_resized = F.interpolate(object_patches_flattened, size = (224, 224), mode = "bilinear", align_corners = False) # (num_patches, C, 224, 224)
             object_region_resized = F.interpolate(object_region.unsqueeze(0), size = (224, 224), mode = "bilinear", align_corners = False) # (1, C, 224, 224)
-            encoder_output = self.image_encoder(torch.cat([object_patches_resized, object_region_resized], dim = 0)) # (num_patches + 1, embed_dim)
+            encoder_output = self.image_encoder(torch.cat([object_patches_resized, object_region_resized], dim = 0)) # (num_patches + 1, box_embed_dim)
 
-            object_patch_embeddings = encoder_output[:-1] # (num_patches, embed_dim)
-            object_region_embedding = encoder_output[-1] # (embed_dim,)
+            object_patch_embeddings = encoder_output[:-1] # (num_patches, box_embed_dim)
+            object_region_embedding = encoder_output[-1].unsqueeze(0) # (1, box_embed_dim)
 
-            object_grid_coords_y = torch.arange(bbox_grid_h, device=object_patches.device, dtype=torch.float32)
-            object_grid_coords_x = torch.arange(bbox_grid_w, device=object_patches.device, dtype=torch.float32)
-            object_grid_coords_y, object_grid_coords_x = torch.meshgrid(object_grid_coords_y, object_grid_coords_x, indexing = "ij") # (bbox_grid_h, bbox_grid_w)
-            object_grid_coords = torch.stack([object_grid_coords_y, object_grid_coords_x], dim = -1) # (bbox_grid_h, bbox_grid_w, 2)
-            object_grid_coords_normalized = object_grid_coords / torch.tensor([bbox_grid_h - 1, bbox_grid_w - 1], device = object_patches.device) # (bbox_grid_h, bbox_grid_w, 2)
-            object_grid_coords_normalized = object_grid_coords_normalized.view(bbox_grid_h * bbox_grid_w, 2) # (bbox_grid_h * bbox_grid_w, 2)
+            object_grid_coords_normalized = self.compute_positional_data(object_patches) # (num_patches, 2)
             object_positional_embeddings = self.positional_encoder(object_grid_coords_normalized) # (num_patches, box_embed_dim)
 
             quantized_patch_embeddings, _, patch_commitment_loss = self.vq(object_patch_embeddings) # (num_patches, box_embed_dim)
             quantized_positional_embeddings, _, positional_commitment_loss = self.vq(object_positional_embeddings) # (num_patches, box_embed_dim)
-            quantized_object_region_embedding, _, region_commitment_loss = self.vq(object_region_embedding) # (embed_dim,)
+            quantized_object_region_embedding, _, region_commitment_loss = self.vq(object_region_embedding) # (1, box_embed_dim)
+            parent_embeddings, parent_commitment_loss = self.compute_parent_embeddings(quantized_patch_embeddings, quantized_positional_embeddings) # (num_patches, num_patches, box_embed_dim)
 
+            #TODO: Move this loss computation below
             foundational_embeddings_separation_loss = self.compute_foundational_embeddings_loss(quantized_patch_embeddings, quantized_positional_embeddings)
-
-            parent_embeddings, parent_commitment_loss = self.compute_parent_embeddings(quantized_patch_embeddings, quantized_positional_embeddings) # (num_patches, num_patches, 6)
-
-            parent_ground_truth_boxes = self.compute_pairwise_intersection_boxes(quantized_patch_embeddings, quantized_positional_embeddings) # (num_patches, num_patches, 6)
+            
+            parent_ground_truth_boxes = self.compute_pairwise_intersection_boxes(quantized_patch_embeddings, quantized_positional_embeddings) # (num_patches, num_patches, box_embed_dim)
             parent_index_pair_inclusion_loss = self.compute_index_pair_inclusion_loss(
-                parent_embeddings.view(num_patches * num_patches, -1),
-                parent_ground_truth_boxes.view(num_patches * num_patches, -1)
+                parent_embeddings.reshape(num_patches * num_patches, -1),
+                parent_ground_truth_boxes.reshape(num_patches * num_patches, -1)
             ) # (num_patches * num_patches,)
+
+            #TODO: Move this loss computation below
             parent_inclusion_loss = parent_index_pair_inclusion_loss.mean()
 
             overall_intersection_box = self.compute_overall_intersection_box(torch.cat([quantized_positional_embeddings, quantized_patch_embeddings], dim = 0)) # (1, box_embed_dim)
 
-            permutation_indices = self.compute_permutation_indices(num_patches) # (num_patches!, 2)
-            parent_permutation_sets = parent_embeddings[permutation_indices[..., 0], permutation_indices[..., 1]] # (num_patches!, num_patches, 6)
-            num_permutations = parent_permutation_sets.shape[0]
-            parent_permutation_intersection_boxes = []
-            for permutation_idx in range(num_permutations):
-                permutation_set = parent_permutation_sets[permutation_idx] # (num_patches, 6)
-                permutation_intersection_box = self.compute_overall_intersection_box(permutation_set) # (1, 6)
-                parent_permutation_intersection_boxes.append(permutation_intersection_box)
+            permutation_set_indices = self.compute_permutation_indices(num_patches) # (num_permutations_sets, num_patches, 2)
+            num_permutation_sets = permutation_set_indices.shape[0]
+            sampled_parent_permutation_sets = parent_embeddings[permutation_set_indices[..., 0], permutation_set_indices[..., 1]] # (num_permutations_sets, num_patches, box_embed_dim)
 
-            parent_permutation_intersection_boxes = torch.stack(parent_permutation_intersection_boxes, dim = 0) # (num_permutations!, 6)
-            parent_permutation_inclusion_losses = self.compute_index_pair_inclusion_loss(
-                parent_permutation_intersection_boxes,
-                overall_intersection_box.expand_as(parent_permutation_intersection_boxes)
-            ) # (num_permutations!,)
-            parent_permutation_inclusion_loss = parent_permutation_inclusion_losses.mean()
+            sampled_permutation_intersection_boxes = []
+            for permutation_idx in range(num_permutation_sets):
+                permutation_set = sampled_parent_permutation_sets[permutation_idx] # (num_patches, box_embed_dim)
+                permutation_intersection_box = self.compute_overall_intersection_box(permutation_set) # (1, box_embed_dim)
+                sampled_permutation_intersection_boxes.append(permutation_intersection_box)
+            
+            sampled_permutation_intersection_boxes = torch.cat(sampled_permutation_intersection_boxes, dim = 0) # (num_permutation_sets, box_embed_dim)
 
-            parent_permutation_pairwise_intersection_boxes = self.compute_pairwise_intersection_boxes(parent_permutation_intersection_boxes, parent_permutation_intersection_boxes) # (num_permutations!, num_permutations!, box_embed_dim)
+            # TODO: Move this loss computation below
+            parent_permutation_inclusion_loss = self.compute_index_pair_inclusion_loss(
+                sampled_permutation_intersection_boxes,
+                overall_intersection_box.expand_as(sampled_permutation_intersection_boxes)
+            ) # (num_permutation_sets,)
 
-            parent_permutation_pairwise_volumes = self.compute_box_volume(parent_permutation_pairwise_intersection_boxes.view(-1, 6)) # (num_permutations! * num_permutations!, 1)
-            parent_permutation_pairwise_volumes = parent_permutation_pairwise_volumes.view(num_permutations, num_permutations) # (num_permutations!, num_permutations)
+            parent_permutation_pairwise_intersection_boxes = self.compute_pairwise_intersection_boxes(sampled_permutation_intersection_boxes, sampled_permutation_intersection_boxes) # (num_permutation_sets, num_permutation_sets, box_embed_dim)
+            parent_permutation_pairwise_volumes = self.compute_box_volume(parent_permutation_pairwise_intersection_boxes.reshape(-1, self.box_embed_dim)) # (num_permutation_sets * num_permutation_sets,)
+            parent_permutation_pairwise_volumes = parent_permutation_pairwise_volumes.reshape(num_permutation_sets, num_permutation_sets) # (num_permutation_sets, num_permutation_sets)
             parent_permutation_pairwise_volumes_upper = parent_permutation_pairwise_volumes.triu(diagonal=1)
-            parent_permutation_separation_loss = torch.sum(parent_permutation_pairwise_volumes_upper) / (num_permutations * (num_permutations - 1)) # scalar
+            parent_permutation_separation_loss = torch.sum(parent_permutation_pairwise_volumes_upper) / (num_permutation_sets * (num_permutation_sets - 1)) # scalar
 
-            correct_parent_set = torch.diagonal(parent_embeddings, 0) # (num_patches, embed_dim)
-            correct_parent_intersection_box = self.compute_overall_intersection_box(correct_parent_set) # (1, 6)
+            correct_parent_set = torch.diagonal(parent_embeddings, 0) # (num_patches, box_embed_dim)
+            correct_parent_intersection_box = self.compute_overall_intersection_box(correct_parent_set) # (1, box_embed_dim)
             object_region_alignment_loss = F.mse_loss(quantized_object_region_embedding, correct_parent_intersection_box) # scalar
 
             batch_loss_tensors["pos_commitment_loss"] += positional_commitment_loss
             batch_loss_tensors["patch_commitment_loss"] += patch_commitment_loss
             batch_loss_tensors["object_region_commitment_loss"] += region_commitment_loss
             batch_loss_tensors["parent_commitment_loss"] += parent_commitment_loss
-            batch_loss_tensors["fundamental_embeddings_separation_loss"] += foundational_embeddings_separation_loss
+            batch_loss_tensors["foundational_embeddings_separation_loss"] += foundational_embeddings_separation_loss
             batch_loss_tensors["parent_inclusion_loss"] += parent_inclusion_loss
             batch_loss_tensors["parent_permutation_inclusion_loss"] += parent_permutation_inclusion_loss
             batch_loss_tensors["parent_permutation_separation_loss"] += parent_permutation_separation_loss
@@ -269,6 +271,13 @@ class PatchBoxEmbeddings(L.LightningModule):
         self.log_dict(batch_loss_tensors, prog_bar=True, on_epoch=True)
         
         return total_loss
+
+    def configure_optimizers(self):
+
+        if self.config['trainer']['optimizer']['type'] == 'Adam':
+            return torch.optim.Adam(self.parameters(), **self.config['trainer']['optimizer']['config'])
+        else:
+            raise ValueError(f"Optimizer type {self.config['trainer']['optimizer']['type']} not implemented.")
 
     def divide_image_into_patches(self, images):
         B, C, H, W = images.shape
@@ -291,18 +300,18 @@ class PatchBoxEmbeddings(L.LightningModule):
         mask_patches_sum = mask_patches.sum(dim = (-1, -2, -3)) # (B, grid_h, grid_w)
         non_empty_patches = mask_patches_sum > 0 # (B, grid_h, grid_w)
 
-        y_coords = torch.arange(grid_h, device = mask_patches.device).view(1, grid_h, 1).expand(B, grid_h, grid_w) # (B, grid_h, grid_w)
-        x_coords = torch.arange(grid_w, device = mask_patches.device).view(1, 1, grid_w).expand(B, grid_h, grid_w) # (B, grid_h, grid_w)
+        y_coords = torch.arange(grid_h, device = mask_patches.device).reshape(1, grid_h, 1).expand(B, grid_h, grid_w) # (B, grid_h, grid_w)
+        x_coords = torch.arange(grid_w, device = mask_patches.device).reshape(1, 1, grid_w).expand(B, grid_h, grid_w) # (B, grid_h, grid_w)
 
         y_coords_masked_min = torch.where(non_empty_patches, y_coords, grid_h + 1)
         x_coords_masked_min = torch.where(non_empty_patches, x_coords, grid_w + 1)
         y_coords_masked_max = torch.where(non_empty_patches, y_coords, -1)
         x_coords_masked_max = torch.where(non_empty_patches, x_coords, -1)
 
-        y_min = y_coords_masked_min.view(B, -1).min(dim=1).values
-        x_min = x_coords_masked_min.view(B, -1).min(dim=1).values
-        y_max = y_coords_masked_max.view(B, -1).max(dim=1).values
-        x_max = x_coords_masked_max.view(B, -1).max(dim=1).values
+        y_min = y_coords_masked_min.reshape(B, -1).min(dim=1).values
+        x_min = x_coords_masked_min.reshape(B, -1).min(dim=1).values
+        y_max = y_coords_masked_max.reshape(B, -1).max(dim=1).values
+        x_max = x_coords_masked_max.reshape(B, -1).max(dim=1).values
 
         y_min = torch.clamp(y_min, 0, grid_h - 1)
         x_min = torch.clamp(x_min, 0, grid_w - 1)
@@ -320,45 +329,56 @@ class PatchBoxEmbeddings(L.LightningModule):
         
         return stitched_image
 
+    def compute_positional_data(self, object_patches):
+        bbox_grid_h, bbox_grid_w = object_patches.shape[:2]
+        object_grid_coords_y = torch.arange(bbox_grid_h, device=object_patches.device, dtype=torch.float32)
+        object_grid_coords_x = torch.arange(bbox_grid_w, device=object_patches.device, dtype=torch.float32)
+        object_grid_coords_y, object_grid_coords_x = torch.meshgrid(object_grid_coords_y, object_grid_coords_x, indexing = "ij") # (bbox_grid_h, bbox_grid_w)
+        object_grid_coords = torch.stack([object_grid_coords_y, object_grid_coords_x], dim = -1) # (bbox_grid_h, bbox_grid_w, 2)
+        object_grid_coords_normalized = object_grid_coords / torch.tensor([bbox_grid_h - 1, bbox_grid_w - 1], device = object_patches.device) # (bbox_grid_h, bbox_grid_w, 2)
+        object_grid_coords_normalized = object_grid_coords_normalized.reshape(bbox_grid_h * bbox_grid_w, 2) # (bbox_grid_h * bbox_grid_w, 2)
+
+        return object_grid_coords_normalized
+
     def split_box_embeddings(self, embeddings):
         return embeddings[:, :self.embed_dim], embeddings[:, self.embed_dim:]
 
     def compute_pairwise_intersection_boxes(self, box_embeddings_1, box_embeddings_2):
-        boxes_min_1, boxes_max_1 = self.split_box_embeddings(box_embeddings_1) # (N, 3), (N, 3)
-        boxes_min_2, boxes_max_2 = self.split_box_embeddings(box_embeddings_2) # (N, 3), (N, 3)
+        boxes_min_1, boxes_max_1 = self.split_box_embeddings(box_embeddings_1) # (N, embed_dim), (N, embed_dim)
+        boxes_min_2, boxes_max_2 = self.split_box_embeddings(box_embeddings_2) # (N, embed_dim), (N, embed_dim)
 
-        boxes_min_1_i = boxes_min_1.unsqueeze(1) # (N, 1, 3)
-        boxes_min_2_j = boxes_min_2.unsqueeze(0) # (1, N, 3)
-        boxes_max_1_i = boxes_max_1.unsqueeze(1) # (N, 1, 3)
-        boxes_max_2_j = boxes_max_2.unsqueeze(0) # (1, N, 3)
+        boxes_min_1_i = boxes_min_1.unsqueeze(1) # (N, 1, embed_dim)
+        boxes_min_2_j = boxes_min_2.unsqueeze(0) # (1, N, embed_dim)
+        boxes_max_1_i = boxes_max_1.unsqueeze(1) # (N, 1, embed_dim)
+        boxes_max_2_j = boxes_max_2.unsqueeze(0) # (1, N, embed_dim)
         
-        intersection_min = torch.max(boxes_min_1_i, boxes_min_2_j) # (N, N, 3)
-        intersection_max = torch.min(boxes_max_1_i, boxes_max_2_j) # (N, N, 3)
-        intersection_boxes = torch.cat([intersection_min, intersection_max], dim=-1) # (N, N, 6)
+        intersection_min = torch.max(boxes_min_1_i, boxes_min_2_j) # (N, N, embed_dim)
+        intersection_max = torch.min(boxes_max_1_i, boxes_max_2_j) # (N, N, embed_dim)
+        intersection_boxes = torch.cat([intersection_min, intersection_max], dim=-1) # (N, N, box_embed_dim)
 
         return intersection_boxes
 
     def compute_index_pair_inclusion_loss(self, box_embeddings_1, box_embeddings_2):
-        boxes_min_1, boxes_max_1 = self.split_box_embeddings(box_embeddings_1) # (N, 3), (N, 3)
-        boxes_min_2, boxes_max_2 = self.split_box_embeddings(box_embeddings_2) # (N, 3), (N, 3)
+        boxes_min_1, boxes_max_1 = self.split_box_embeddings(box_embeddings_1) # (N, embed_dim), (N, embed_dim)
+        boxes_min_2, boxes_max_2 = self.split_box_embeddings(box_embeddings_2) # (N, embed_dim), (N, embed_dim)
 
-        min_violation = F.relu(boxes_min_1 - boxes_min_2) # (N, 3)
-        max_violation = F.relu(boxes_max_2 - boxes_max_1) # (N, 3)
+        min_violation = F.relu(boxes_min_1 - boxes_min_2) # (N, embed_dim)
+        max_violation = F.relu(boxes_max_2 - boxes_max_1) # (N, embed_dim)
         loss = min_violation.sum(dim=-1) + max_violation.sum(dim=-1) # (N,)
         
         return loss
 
     def compute_overall_intersection_box(self, box_embeddings):
-        boxes_min, boxes_max = self.split_box_embeddings(box_embeddings) # (N, 3), (N, 3)
-        intersection_min = torch.max(boxes_min, dim = 0).values.unsqueeze(0) # (1, 3)
-        intersection_max = torch.min(boxes_max, dim = 0).values.unsqueeze(0) # (1, 3)
-        intersection_box = torch.cat([intersection_min, intersection_max], dim = -1) # (1, 6)
+        boxes_min, boxes_max = self.split_box_embeddings(box_embeddings) # (N, embed_dim), (N, embed_dim)
+        intersection_min = torch.max(boxes_min, dim = 0).values.unsqueeze(0) # (1, embed_dim)
+        intersection_max = torch.min(boxes_max, dim = 0).values.unsqueeze(0) # (1, embed_dim)
+        intersection_box = torch.cat([intersection_min, intersection_max], dim = -1) # (1, box_embed_dim)
         
         return intersection_box
 
     def compute_box_volume(self, box_embeddings):
-        boxes_min, boxes_max = self.split_box_embeddings(box_embeddings) # (N, 3), (N, 3)
-        box_sizes = boxes_max - boxes_min
+        boxes_min, boxes_max = self.split_box_embeddings(box_embeddings) # (N, embed_dim), (N, embed_dim)
+        box_sizes = boxes_max - boxes_min # (N, embed_dim)
         box_volume = torch.prod(box_sizes, dim=-1) # (N,)
         
         return box_volume
@@ -373,10 +393,25 @@ class PatchBoxEmbeddings(L.LightningModule):
         return torch.sum(loss)
 
     def compute_permutation_indices(self, num_elements):
-        permutations = list(itertools.permutations(range(num_elements)))
-        cols = torch.tensor(permutations, dtype=torch.long)
-        rows = torch.arange(num_elements, dtype=torch.long).unsqueeze(0).expand(len(permutations), -1)
-        indices = torch.stack([rows, cols], dim=-1)
+        # permutations = list(itertools.permutations(range(num_elements)))
+        # import ipdb; ipdb.set_trace()
+        # num_permutations_sets = min(self.permutation_samples, len(permutations))
+        # permutations_sampled = random.sample(permutations, num_permutations_sets)
+        total_possible_permutations = math.factorial(num_elements)
+        num_permutations_sets = min(self.permutation_samples, total_possible_permutations)
+        permutation_sets = []
+        permutation_sets_filled = False
+        while not permutation_sets_filled:
+            base_list = list(range(num_elements))
+            random.shuffle(base_list)
+            if base_list not in permutation_sets:
+                permutation_sets.append(base_list)
+            if len(permutation_sets) == num_permutations_sets:
+                permutation_sets_filled = True
+
+        cols = torch.tensor(permutation_sets, dtype=torch.long) # (num_permutations_sets, num_elements)
+        rows = torch.arange(num_elements, dtype=torch.long).unsqueeze(0).expand(num_permutations_sets, -1) # (num_permutations_sets, num_elements)
+        indices = torch.stack([rows, cols], dim=-1) # (num_permutations_sets, num_elements, 2)
 
         return indices
 
@@ -394,11 +429,11 @@ class PatchBoxEmbeddings(L.LightningModule):
 
     def compute_parent_embeddings(self, quantized_patch_embeddings, quantized_positional_embeddings):
         num_patches = quantized_patch_embeddings.shape[0]
-        pos_expand = quantized_positional_embeddings.unsqueeze(1).expand(-1, num_patches, -1) # (N, N, 6)
-        patch_expand = quantized_patch_embeddings.unsqueeze(0).expand(num_patches, -1, -1) # (N, N, 6)
-        dense_concat = torch.cat([pos_expand, patch_expand], dim=-1) # (N, N, 12)
-        parent_embeddings = self.binding_function(dense_concat.view(num_patches * num_patches, -1)) # (N * N, 6)
-        parent_embeddings, _, parent_commitment_loss = self.vq(parent_embeddings) # (N * N, 6)
-        parent_embeddings = parent_embeddings.view(num_patches, num_patches, -1) # (N, N, 6)
+        pos_expand = quantized_positional_embeddings.unsqueeze(1).expand(-1, num_patches, -1) # (N, N, box_embed_dim)
+        patch_expand = quantized_patch_embeddings.unsqueeze(0).expand(num_patches, -1, -1) # (N, N, box_embed_dim)
+        dense_concat = torch.cat([pos_expand, patch_expand], dim=-1) # (N, N, box_embed_dim * 2)
+        parent_embeddings = self.binding_function(dense_concat.reshape(num_patches * num_patches, -1)) # (N * N, box_embed_dim)
+        parent_embeddings, _, parent_commitment_loss = self.vq(parent_embeddings) # (N * N, box_embed_dim)
+        parent_embeddings = parent_embeddings.reshape(num_patches, num_patches, -1) # (N, N, box_embed_dim)
 
         return parent_embeddings, parent_commitment_loss

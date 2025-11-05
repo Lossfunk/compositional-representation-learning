@@ -18,3 +18,8 @@ data:
       shuffle: True
 
 trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001
