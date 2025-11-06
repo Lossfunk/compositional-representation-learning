@@ -38,19 +38,19 @@ class v0Dataset(Dataset):
         }
 
     def generate_image(self):
-        image = np.zeros(self.image_size, dtype=np.uint8)
-        mask = np.zeros(self.image_size[0:2], dtype=np.uint8)
+        image = np.zeros([self.image_size[0], self.image_size[1], 3], dtype=np.uint8)
+        mask = np.zeros(self.image_size, dtype=np.uint8)
         
         shape = random.choice(self.shapes)
         color = self.color_map[random.choice(self.colors)]
         
         if shape == "circle":
-            radius = np.random.randint(10, 50)
+            radius = np.random.randint(10, 30)
             center = (np.random.randint(radius, self.image_size[1] - radius), np.random.randint(radius, self.image_size[0] - radius))
             cv2.circle(image, center, radius, color, -1)
             cv2.circle(mask, center, radius, 255, -1)
         elif shape == "square":
-            side_length = np.random.randint(10, 50)
+            side_length = np.random.randint(10, 30)
             top_left = (np.random.randint(0, self.image_size[1] - side_length), np.random.randint(0, self.image_size[0] - side_length))
             cv2.rectangle(image, top_left, (top_left[0] + side_length, top_left[1] + side_length), color, -1)
             cv2.rectangle(mask, top_left, (top_left[0] + side_length, top_left[1] + side_length), 255, -1)
