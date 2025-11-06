@@ -1,0 +1,49 @@
+model:
+  type: PatchBoxEmbeddings
+  config:
+    image_encoder: "resnet"
+    embed_dim: 3
+    hidden_dim: 64
+    num_hidden_layers: 3
+    grid_size: [16, 16]
+    permutation_samples: 10
+    codebook_clamp_epsilon: 0.5
+    positive_volume_min_side: 0.5
+    foundational_embeddings_distance_margin: 0.5
+    codebook_config:
+      codebook_size: 512
+      decay: 0.8
+      commitment_weight: 0.1
+      kmeans_init: True
+      threshold_ema_dead_code: 2
+    loss_weights:
+      codebook_positive_volume_loss: 10.0
+      pos_commitment_loss: 1.0
+      patch_commitment_loss: 1.0
+      object_region_commitment_loss: 1.0
+      parent_commitment_loss: 1.0
+      foundational_embeddings_separation_loss: 20.0
+      parent_inclusion_loss: 1.0
+      parent_permutation_inclusion_loss: 1.0
+      parent_permutation_separation_loss: 1.0
+      object_region_alignment_loss: 1.0
+      
+
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size: [256, 256, 3]
+      shapes: ["circle", "square"]
+      colors: ["red", "blue"]
+      num_samples: 1000
+    dataloader_config:
+      batch_size: 32
+      shuffle: True
+
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

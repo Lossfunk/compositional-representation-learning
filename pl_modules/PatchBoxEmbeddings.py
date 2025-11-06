@@ -9,6 +9,8 @@ import lightning as L
 from torchvision import transforms
 from vector_quantize_pytorch import VectorQuantize
 
+from models.ResNetImageEncoder import ResNetImageEncoder
+
 class ImageEncoder(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
@@ -105,26 +107,28 @@ class ImageEncoder(nn.Module):
 
 
 class PositionalEncoder(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_hidden_layers):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
+        layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
+        for _ in range(num_hidden_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
 
 
 class BindingFunction(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_hidden_layers):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
+        layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
+        for _ in range(num_hidden_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
@@ -138,24 +142,31 @@ class PatchBoxEmbeddings(L.LightningModule):
         self.embed_dim = config['model']['config']['embed_dim']
         self.box_embed_dim = self.embed_dim * 2
         self.hidden_dim = config['model']['config']['hidden_dim']
+        self.num_hidden_layers = config['model']['config']['num_hidden_layers']
         self.grid_size = config['model']['config']['grid_size']
-        self.permutation_samples = 5
+        self.permutation_samples = config['model']['config']['permutation_samples']
+        self.codebook_clamp_epsilon = config['model']['config']['codebook_clamp_epsilon']
+        self.positive_volume_min_side = config['model']['config']['positive_volume_min_side']
+        self.foundational_embeddings_distance_margin = config['model']['config']['foundational_embeddings_distance_margin']
 
-        self.image_encoder = ImageEncoder(embed_dim = self.box_embed_dim)
-        self.positional_encoder = PositionalEncoder(input_dim = 2, output_dim = self.box_embed_dim, hidden_dim = self.hidden_dim)
-        self.binding_function = BindingFunction(input_dim = self.box_embed_dim * 2, output_dim = self.box_embed_dim, hidden_dim = self.hidden_dim)
-
-        self.image_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Resize(self.config['data']['train']['config']['image_size'][:2])
-        ])
+        if config['model']['config']['image_encoder'] == "resnet":
+            self.image_encoder = ResNetImageEncoder(embed_dim = self.box_embed_dim)
+        else:
+            self.image_encoder = ImageEncoder(embed_dim = self.box_embed_dim)
+        
+        self.positional_encoder = PositionalEncoder(input_dim = 2, output_dim = self.box_embed_dim, hidden_dim = self.hidden_dim, num_hidden_layers = self.num_hidden_layers)
+        self.binding_function = BindingFunction(input_dim = self.box_embed_dim * 2, output_dim = self.box_embed_dim, hidden_dim = self.hidden_dim, num_hidden_layers = self.num_hidden_layers)
 
         self.vq = VectorQuantize(
             dim = self.box_embed_dim,
-            codebook_size = 512,
-            decay = 0.8,
-            commitment_weight = 1.
+            **config['model']['config']['codebook_config']
         )
+
+        self.loss_weights = config['model']['config']['loss_weights']
+
+        IMAGENET_MEAN = [0.485, 0.456, 0.406]
+        IMAGENET_STD = [0.229, 0.224, 0.225]
+        self.image_normalizer = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
 
     def forward(self, x):
         images = x['images'] # (batch_size, 3, H, W)
@@ -200,7 +211,10 @@ class PatchBoxEmbeddings(L.LightningModule):
 
             object_patches_resized = F.interpolate(object_patches_flattened, size = (224, 224), mode = "bilinear", align_corners = False) # (num_patches, C, 224, 224)
             object_region_resized = F.interpolate(object_region.unsqueeze(0), size = (224, 224), mode = "bilinear", align_corners = False) # (1, C, 224, 224)
-            encoder_output = self.image_encoder(torch.cat([object_patches_resized, object_region_resized], dim = 0)) # (num_patches + 1, box_embed_dim)
+            encoder_input = torch.cat([object_patches_resized, object_region_resized], dim = 0)
+            if self.config['model']['config']['image_encoder'] == "resnet":
+                encoder_input = self.image_normalizer(encoder_input)
+            encoder_output = self.image_encoder(encoder_input) # (num_patches + 1, box_embed_dim)
 
             object_patch_embeddings = encoder_output[:-1] # (num_patches, box_embed_dim)
             object_region_embedding = encoder_output[-1].unsqueeze(0) # (1, box_embed_dim)
@@ -270,6 +284,7 @@ class PatchBoxEmbeddings(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         batch_loss_tensors = self.forward(batch)
+        batch_loss_tensors = {key: value * self.loss_weights[key] for key, value in batch_loss_tensors.items()}
         total_loss = sum(batch_loss_tensors.values())
         self.log("train_loss", total_loss, prog_bar=True, on_epoch=True)
         self.log_dict(batch_loss_tensors, prog_bar=True, on_epoch=True)
@@ -286,7 +301,7 @@ class PatchBoxEmbeddings(L.LightningModule):
     def on_train_batch_end(self, outputs, batch, batch_idx):
         with torch.no_grad():
             min_embed, max_embed = self.split_box_embeddings(self.vq.codebook)
-            clamped_max = torch.max(max_embed, min_embed + 1e-4)
+            clamped_max = torch.max(max_embed, min_embed + self.codebook_clamp_epsilon)
             self.vq.codebook.data[:, self.embed_dim:] = clamped_max
 
     def divide_image_into_patches(self, images):
@@ -394,11 +409,11 @@ class PatchBoxEmbeddings(L.LightningModule):
         
         return log_volume
 
-    def compute_positive_volume_loss(self, box_embeddings, min_side = 0.1):
+    def compute_positive_volume_loss(self, box_embeddings):
         num_boxes = box_embeddings.shape[0]
         boxes_min, boxes_max = self.split_box_embeddings(box_embeddings)
         box_sizes = boxes_max - boxes_min
-        loss = F.relu(min_side - box_sizes)
+        loss = F.relu(self.positive_volume_min_side - box_sizes)
         loss = torch.sum(loss) / num_boxes
 
         return torch.sum(loss)
@@ -444,7 +459,7 @@ class PatchBoxEmbeddings(L.LightningModule):
         foundational_embeddings_min, foundational_embeddings_max = self.split_box_embeddings(foundational_embeddings) # (N + num_unique, embed_dim), (N + num_unique, embed_dim)
         foundational_embeddings_centers = (foundational_embeddings_min + foundational_embeddings_max) / 2.0 # (N + num_unique, embed_dim)
         
-        foundational_embeddings_distance_margin = 0.1
+        foundational_embeddings_distance_margin = self.foundational_embeddings_distance_margin
         foundational_embeddings_pairwise_distances = torch.cdist(foundational_embeddings_centers, foundational_embeddings_centers, p=2) # (N + num_unique, N + num_unique)
         foundational_embeddings_separation_loss = F.relu(foundational_embeddings_distance_margin - foundational_embeddings_pairwise_distances) # (N + num_unique, N + num_unique)
         
