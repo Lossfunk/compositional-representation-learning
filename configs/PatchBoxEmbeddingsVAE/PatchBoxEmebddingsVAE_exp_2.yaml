@@ -7,8 +7,8 @@ model:
     gumbel_temp: 1.0
     loss_weights:
       reconstruction_loss: 1.0
-      inclusion_loss: 1.0
-      box_volume_regularization_loss: 1.0
+      inclusion_loss: 0
+      box_volume_regularization_loss: 0
 
 data:
   train:

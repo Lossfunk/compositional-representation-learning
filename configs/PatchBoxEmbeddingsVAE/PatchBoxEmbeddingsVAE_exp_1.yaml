@@ -5,10 +5,12 @@ model:
     hidden_dims: [32, 64, 128, 256, 512]
     grid_size: [4, 4]
     gumbel_temp: 1.0
+    min_side_length: 0.1
     loss_weights:
       reconstruction_loss: 1.0
       inclusion_loss: 1.0
-      box_volume_regularization_loss: 1.0
+      box_volume_regularization_loss: 0.0
+      min_side_regularization_loss: 1.0
 
 data:
   train:

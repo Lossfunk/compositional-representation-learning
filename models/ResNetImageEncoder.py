@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from torchvision.transforms import v2 as transforms # Using v2 for modern transforms
+from torchvision.transforms import v2 as transforms  # Using v2 for modern transforms
+
 
 class ResNetImageEncoder(nn.Module):
     """
@@ -9,6 +10,7 @@ class ResNetImageEncoder(nn.Module):
     feature extractor and passes the features through a small MLP
     to produce a final embedding of a specified dimension.
     """
+
     def __init__(self, embed_dim: int):
         """
         Initializes the model.
@@ -44,7 +46,7 @@ class ResNetImageEncoder(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(num_ftrs, num_ftrs // 2),  # 512 -> 256
             nn.ReLU(inplace=True),
-            nn.Linear(num_ftrs // 2, embed_dim)   # 256 -> embed_dim
+            nn.Linear(num_ftrs // 2, embed_dim),  # 256 -> embed_dim
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
