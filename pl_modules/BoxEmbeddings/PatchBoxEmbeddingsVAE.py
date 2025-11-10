@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import wandb
 import lpips
+from pytorch_msssim import SSIM
 
 from box_embeddings.parameterizations.box_tensor import (
     BoxTensor,
@@ -86,7 +87,7 @@ class VanillaVAE(nn.Module):
                 kernel_size=3,
                 padding=1,
             ),
-            nn.Tanh(),
+            nn.Sigmoid(),
         )
 
     def encode(self, input):
@@ -135,7 +136,19 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         self.box_volume_regularizer = L2SideBoxRegularizer(log_scale=True, weight=1.0)
 
         # Initialize LPIPS loss
-        self.lpips_loss_fn = lpips.LPIPS(net="vgg")
+        if "lpips_loss" in self.loss_weights and self.loss_weights["lpips_loss"] > 0:
+            self.lpips_loss_fn = lpips.LPIPS(net="vgg")
+        else:
+            self.lpips_loss_fn = None
+
+        # Initialize SSIM loss
+        # Using win_size=11, data_range=1 (for normalized [0,1] range), channel=3 (RGB)
+        if "ssim_loss" in self.loss_weights and self.loss_weights["ssim_loss"] > 0:
+            self.ssim_loss_fn = SSIM(
+                win_size=11, win_sigma=1.5, data_range=1, size_average=True, channel=3
+            )
+        else:
+            self.ssim_loss_fn = None
 
         self.viz_datapoint = None
 
@@ -258,20 +271,33 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         )
 
         # Calculate LPIPS loss if weight is provided
-        if "lpips_loss" in self.loss_weights:
-            # Flatten the batch dimension with num_patches+1 dimension for LPIPS
-            batch_size = outputs["reconstructed_images"].shape[0]
-            num_images = outputs["reconstructed_images"].shape[1]
+        if "lpips_loss" in self.loss_weights and self.loss_weights["lpips_loss"] > 0:
             reconstructed_flat = outputs["reconstructed_images"].reshape(
                 -1, 3, self.image_size[0], self.image_size[1]
             )
             images_flat = outputs["images"].reshape(-1, 3, self.image_size[0], self.image_size[1])
 
-            # LPIPS expects inputs in range [-1, 1], which our Tanh output already provides
-            lpips_loss_value = self.lpips_loss_fn(reconstructed_flat, images_flat).mean()
-            lpips_loss = lpips_loss_value * self.loss_weights["lpips_loss"]
+            reconstructed_flat = (reconstructed_flat * 2.0) - 1.0
+            images_flat = (images_flat * 2.0) - 1.0
+
+            lpips_loss = (
+                self.lpips_loss_fn(reconstructed_flat, images_flat).mean()
+                * self.loss_weights["lpips_loss"]
+            )
         else:
             lpips_loss = torch.tensor(0.0, device=self.device)
+
+        # Calculate SSIM loss if weight is provided
+        if "ssim_loss" in self.loss_weights and self.loss_weights["ssim_loss"] > 0:
+            reconstructed_flat = outputs["reconstructed_images"].reshape(
+                -1, 3, self.image_size[0], self.image_size[1]
+            )
+            images_flat = outputs["images"].reshape(-1, 3, self.image_size[0], self.image_size[1])
+
+            ssim_value = self.ssim_loss_fn(reconstructed_flat, images_flat)
+            ssim_loss = (1.0 - ssim_value) * self.loss_weights["ssim_loss"]
+        else:
+            ssim_loss = torch.tensor(0.0, device=self.device)
 
         total_loss = (
             reconstruction_loss
@@ -279,6 +305,7 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             + box_volume_regularization_loss
             + min_side_regularization_loss
             + lpips_loss
+            + ssim_loss
         )
 
         loss_dict = {
@@ -289,8 +316,12 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             "total_loss": total_loss,
         }
 
-        if "lpips_loss" in self.loss_weights:
+        if "lpips_loss" in self.loss_weights and self.loss_weights["lpips_loss"] > 0:
             loss_dict["lpips_loss"] = lpips_loss
+
+        if "ssim_loss" in self.loss_weights and self.loss_weights["ssim_loss"] > 0:
+            loss_dict["ssim_loss"] = ssim_loss
+
         self.log_dict(loss_dict, prog_bar=True, on_epoch=True)
 
         return total_loss
