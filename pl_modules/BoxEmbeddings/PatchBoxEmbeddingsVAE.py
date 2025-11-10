@@ -311,7 +311,7 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         return patches
 
     def min_side_regularization(self, box_tensors):
-        side_lengths = box_tensors.z - box_tensors.Z
+        side_lengths = box_tensors.Z - box_tensors.z
         penalty = F.relu(self.min_side_length - side_lengths)
         penalty = penalty.sum(dim=-1).mean()
         return penalty

@@ -20,6 +20,7 @@ data:
       shapes: ["circle", "square"]
       colors: ["red", "blue"]
       num_samples: 1000
+      return_metadata: True
     dataloader_config:
       batch_size: 32
       shuffle: True

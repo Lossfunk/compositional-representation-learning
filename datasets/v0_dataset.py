@@ -10,6 +10,7 @@ class v0Dataset(Dataset):
     def __init__(self, config):
 
         self.config = config
+        self.return_metadata = config["return_metadata"]
 
         self.image_size = config["image_size"]
         self.shapes = config["shapes"]
@@ -28,11 +29,13 @@ class v0Dataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        image, mask = self.generate_image()
+        image, mask, metadata = self.generate_image()
         image = self.transform(image)
         mask = self.transform(mask).squeeze(0)
-
-        return {"images": image, "object_masks": mask}
+        if self.return_metadata:
+            return {"images": image, "object_masks": mask, "metadata": metadata}
+        else:
+            return {"images": image, "object_masks": mask}
 
     def generate_image(self):
         image = np.zeros([self.image_size[0], self.image_size[1], 3], dtype=np.uint8)
@@ -70,4 +73,9 @@ class v0Dataset(Dataset):
                 -1,
             )
 
-        return image, mask
+        metadata = {
+            "shape": shape,
+            "color": color,
+        }
+
+        return image, mask, metadata
