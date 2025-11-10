@@ -4,6 +4,7 @@ import lightning as L
 import torch.nn.functional as F
 import numpy as np
 import wandb
+import lpips
 
 from box_embeddings.parameterizations.box_tensor import (
     BoxTensor,
@@ -133,6 +134,9 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         self.box_intersection = Intersection(intersection_temperature=self.gumbel_temp)
         self.box_volume_regularizer = L2SideBoxRegularizer(log_scale=True, weight=1.0)
 
+        # Initialize LPIPS loss
+        self.lpips_loss_fn = lpips.LPIPS(net="vgg")
+
         self.viz_datapoint = None
 
     def forward(self, x):
@@ -253,11 +257,28 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             * self.loss_weights["min_side_regularization_loss"]
         )
 
+        # Calculate LPIPS loss if weight is provided
+        if "lpips_loss" in self.loss_weights:
+            # Flatten the batch dimension with num_patches+1 dimension for LPIPS
+            batch_size = outputs["reconstructed_images"].shape[0]
+            num_images = outputs["reconstructed_images"].shape[1]
+            reconstructed_flat = outputs["reconstructed_images"].reshape(
+                -1, 3, self.image_size[0], self.image_size[1]
+            )
+            images_flat = outputs["images"].reshape(-1, 3, self.image_size[0], self.image_size[1])
+
+            # LPIPS expects inputs in range [-1, 1], which our Tanh output already provides
+            lpips_loss_value = self.lpips_loss_fn(reconstructed_flat, images_flat).mean()
+            lpips_loss = lpips_loss_value * self.loss_weights["lpips_loss"]
+        else:
+            lpips_loss = torch.tensor(0.0, device=self.device)
+
         total_loss = (
             reconstruction_loss
             + inclusion_loss
             + box_volume_regularization_loss
             + min_side_regularization_loss
+            + lpips_loss
         )
 
         loss_dict = {
@@ -267,6 +288,9 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             "min_side_regularization_loss": min_side_regularization_loss,
             "total_loss": total_loss,
         }
+
+        if "lpips_loss" in self.loss_weights:
+            loss_dict["lpips_loss"] = lpips_loss
         self.log_dict(loss_dict, prog_bar=True, on_epoch=True)
 
         return total_loss
