@@ -15,6 +15,8 @@ class v0Dataset(Dataset):
         self.image_size = config["image_size"]
         self.shapes = config["shapes"]
         self.colors = config["colors"]
+        self.center_range = config["center_range"]
+        self.size_range = config["size_range"]
         self.color_map = {"red": (255, 0, 0), "blue": (0, 0, 255)}
 
         self.num_samples = config["num_samples"]
@@ -45,30 +47,30 @@ class v0Dataset(Dataset):
         color = self.color_map[random.choice(self.colors)]
 
         if shape == "circle":
-            radius = np.random.randint(10, 30)
+            radius = np.random.randint(self.size_range[0], self.size_range[1]) // 2
             center = (
-                np.random.randint(radius, self.image_size[1] - radius),
-                np.random.randint(radius, self.image_size[0] - radius),
+                np.random.randint(self.center_range[0], self.center_range[1]),
+                np.random.randint(self.center_range[0], self.center_range[1]),
             )
             cv2.circle(image, center, radius, color, -1)
             cv2.circle(mask, center, radius, 255, -1)
         elif shape == "square":
-            side_length = np.random.randint(10, 30)
-            top_left = (
-                np.random.randint(0, self.image_size[1] - side_length),
-                np.random.randint(0, self.image_size[0] - side_length),
+            side_length = np.random.randint(self.size_range[0], self.size_range[1])
+            center = (
+                np.random.randint(self.center_range[0], self.center_range[1]),
+                np.random.randint(self.center_range[0], self.center_range[1]),
             )
             cv2.rectangle(
                 image,
-                top_left,
-                (top_left[0] + side_length, top_left[1] + side_length),
+                (center[0] - side_length // 2, center[1] - side_length // 2),
+                (center[0] + side_length // 2, center[1] + side_length // 2),
                 color,
                 -1,
             )
             cv2.rectangle(
                 mask,
-                top_left,
-                (top_left[0] + side_length, top_left[1] + side_length),
+                (center[0] - side_length // 2, center[1] - side_length // 2),
+                (center[0] + side_length // 2, center[1] + side_length // 2),
                 255,
                 -1,
             )

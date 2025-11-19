@@ -4,6 +4,7 @@ import lightning as L
 import torch.nn.functional as F
 import numpy as np
 import wandb
+from matplotlib import pyplot as plt
 import lpips
 from pytorch_msssim import SSIM
 
@@ -330,6 +331,7 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         image_patch_intersection_volume = self.box_volume(
             self.box_intersection(image_box_tensor, patch_intersection_box)
         )
+        patch_intersection_volume = self.box_volume(patch_intersection_box)
 
         # reconstruction_loss = (
         #     F.mse_loss(
@@ -363,6 +365,15 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         inclusion_loss = (
             image_box_volume - image_patch_intersection_volume
         ).mean() * self.loss_weights["inclusion_loss"]
+        if (
+            "patch_tightness_loss" in self.loss_weights
+            and self.loss_weights["patch_tightness_loss"] > 0
+        ):
+            patch_tightness_loss = (
+                patch_intersection_volume - image_patch_intersection_volume
+            ).mean() * self.loss_weights["patch_tightness_loss"]
+        else:
+            patch_tightness_loss = torch.tensor(0.0, device=self.device)
         box_volume_regularization_loss = (
             self.box_volume_regularizer(all_box_tensors).mean()
             * self.loss_weights["box_volume_regularization_loss"]
@@ -463,13 +474,26 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         else:
             ssim_loss = torch.tensor(0.0, device=self.device)
 
+        # Calculate supervised contrastive loss if weight is provided
+        if (
+            "supervised_contrastive_loss" in self.loss_weights
+            and self.loss_weights["supervised_contrastive_loss"] > 0
+        ):
+            supervised_contrastive_loss = self.compute_supervised_contrastive_loss(
+                image_box_tensor, batch
+            )
+        else:
+            supervised_contrastive_loss = torch.tensor(0.0, device=self.device)
+
         total_loss = (
             reconstruction_loss
             + inclusion_loss
+            + patch_tightness_loss
             + box_volume_regularization_loss
             + min_side_regularization_loss
             + lpips_loss
             + ssim_loss
+            + supervised_contrastive_loss
         )
 
         loss_dict = {
@@ -477,6 +501,7 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             "patch_reconstruction_loss": patch_reconstruction_loss,
             "full_image_reconstruction_loss": full_image_reconstruction_loss,
             "inclusion_loss": inclusion_loss,
+            "patch_tightness_loss": patch_tightness_loss,
             "box_volume_regularization_loss": box_volume_regularization_loss,
             "min_side_regularization_loss": min_side_regularization_loss,
             "total_loss": total_loss,
@@ -489,6 +514,12 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             loss_dict["ssim_loss"] = ssim_loss
             loss_dict["ssim_loss_patches"] = ssim_loss_patches
             loss_dict["ssim_loss_full_image"] = ssim_loss_full_image
+
+        if (
+            "supervised_contrastive_loss" in self.loss_weights
+            and self.loss_weights["supervised_contrastive_loss"] > 0
+        ):
+            loss_dict["supervised_contrastive_loss"] = supervised_contrastive_loss
 
         # Log number of valid patches if crop_objects is enabled
         if self.crop_objects:
@@ -521,6 +552,7 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             )
             self.logger.experiment.log({"reconstruction_visualization": fig})
             self.viz_datapoint = None
+            plt.close(fig)
 
     def divide_image_into_patches(self, images):
         B, C, H, W = images.shape
@@ -624,3 +656,71 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         penalty = F.relu(self.min_side_length - side_lengths)
         penalty = penalty.sum(dim=-1).mean()
         return penalty
+
+    def compute_supervised_contrastive_loss(self, image_box_tensor, batch):
+        """
+        Compute supervised contrastive loss that penalizes intersection volume
+        between boxes of different shapes (circle vs square).
+
+        Args:
+            image_box_tensor: BoxTensor of shape (batch_size, 2, embed_dim) representing
+                            the full image box embeddings
+            batch: Batch dictionary that should contain "metadata" with shape information
+
+        Returns:
+            loss: Scalar tensor representing the supervised contrastive loss
+        """
+        if "metadata" not in batch:
+            return torch.tensor(0.0, device=self.device)
+
+        batch_size = image_box_tensor.z.shape[0]
+        metadata = batch["metadata"]
+
+        # Extract shapes from metadata
+        # metadata is a dict with 'shape' key containing a list of shape strings
+        shapes = metadata["shape"]
+
+        # Find indices for circles and squares
+        circle_indices = [i for i, shape in enumerate(shapes) if shape == "circle"]
+        square_indices = [i for i, shape in enumerate(shapes) if shape == "square"]
+
+        if len(circle_indices) == 0 or len(square_indices) == 0:
+            # Need both shapes in the batch to compute contrastive loss
+            return torch.tensor(0.0, device=self.device)
+
+        # Extract circle and square box tensors
+        # Stack min and max to create (num_circles, 2, embed_dim) format
+        circle_embeddings = torch.stack(
+            [image_box_tensor.z[circle_indices], image_box_tensor.Z[circle_indices]], dim=1
+        )  # (num_circles, 2, embed_dim)
+        square_embeddings = torch.stack(
+            [image_box_tensor.z[square_indices], image_box_tensor.Z[square_indices]], dim=1
+        )  # (num_squares, 2, embed_dim)
+
+        circle_boxes = BoxTensor(circle_embeddings)
+        square_boxes = BoxTensor(square_embeddings)
+
+        # Compute intersection volumes between all circle-square pairs
+        intersection_volumes = []
+        for i in range(len(circle_indices)):
+            for j in range(len(square_indices)):
+                # Compute intersection between circle i and square j
+                intersection_box = self.box_intersection(
+                    circle_boxes[i : i + 1], square_boxes[j : j + 1]
+                )
+                intersection_volume = self.box_volume(intersection_box)
+                # Clamp to non-negative: volume should never be negative, but numerical issues
+                # with log_scale or invalid intersections might cause negative values
+                intersection_volume = torch.clamp(intersection_volume, min=0.0)
+                intersection_volumes.append(intersection_volume)
+
+        if len(intersection_volumes) > 0:
+            # Sum all intersection volumes and penalize them
+            total_intersection_volume = torch.stack(intersection_volumes).sum()
+            supervised_contrastive_loss = (
+                total_intersection_volume * self.loss_weights["supervised_contrastive_loss"]
+            )
+        else:
+            supervised_contrastive_loss = torch.tensor(0.0, device=self.device)
+
+        return supervised_contrastive_loss

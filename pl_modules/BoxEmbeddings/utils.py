@@ -64,5 +64,5 @@ def create_reconstruction_visualization(viz_datapoint, grid_size, image_size, cu
                 ax.set_title("Reconstructed Patches")
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
+
     return fig
