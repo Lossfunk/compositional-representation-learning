@@ -1,0 +1,34 @@
+model:
+  type: PatchBoxEmbeddingsVAE
+  config:
+    embed_dim: 64
+    hidden_dims: [32, 64, 128, 256]
+    grid_size: [4, 4]
+    gumbel_temp: 1.0
+    min_side_length: 0.1
+    crop_objects: False
+    loss_weights:
+      reconstruction_loss: 10.0
+      inclusion_loss: 0.0
+      box_volume_regularization_loss: 0.0
+      min_side_regularization_loss: 0.0
+      lpips_loss: 0.0
+      ssim_loss: 0.5
+      full_image_weight: 100.0
+
+data:
+  train:
+    type: CIFAR10Dataset
+    config:
+      image_size: [32, 32]
+      train: True
+    dataloader_config:
+      batch_size: 64
+      shuffle: True
+
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

@@ -277,7 +277,9 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             num_valid_patches = batch_size * num_patches
 
         if self.viz_datapoint is None:
-            self.viz_datapoint = {key: value[0].cpu() for key, value in outputs.items()}
+            self.viz_datapoint = {
+                key: value[0].cpu() for key, value in outputs.items() if key != "valid_patch_mask"
+            }
 
         all_box_embeddings = torch.stack(
             [outputs["mu_min"], outputs["mu_max"]], dim=2
