@@ -1,0 +1,44 @@
+model:
+  type: PatchBoxEmbeddingsVAE
+  config:
+    embed_dim: 3
+    hidden_dims: [4, 8, 16, 32, 64]
+    grid_size: [4, 4]
+    gumbel_temp: 1.0
+    min_side_length: 0.1
+    crop_objects: True
+    loss_weights:
+      reconstruction_loss: 5.0
+      inclusion_loss: 1.0
+      patch_tightness_loss: 1.0
+      box_volume_regularization_loss: 0.0
+      min_side_regularization_loss: 1.0
+      lpips_loss: 0.0
+      ssim_loss: 1.0
+      full_image_weight: 10.0
+      supervised_contrastive_loss_intersection: 1.0
+      supervised_contrastive_loss_distance: 1.0
+      supervised_contrastive_loss_distance_margin: 10.0
+
+
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size: [64, 64]
+      shapes: ["circle", "square"]
+      colors: ["red"]
+      num_samples: 1000
+      return_metadata: True
+      center_range: [32, 33]
+      size_range: [20, 21]
+    dataloader_config:
+      batch_size: 32
+      shuffle: True
+
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

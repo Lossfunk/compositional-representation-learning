@@ -18,99 +18,7 @@ from box_embeddings.modules.regularization import (
 )
 
 from .utils import create_reconstruction_visualization
-
-
-class VanillaVAE(nn.Module):
-    def __init__(self, latent_dim, hidden_dims):
-        super(VanillaVAE, self).__init__()
-
-        self.latent_dim = latent_dim
-        self.hidden_dims = hidden_dims
-
-        encoder_modules = []
-        in_channels = 3
-        for h_dim in hidden_dims:
-            encoder_modules.append(
-                nn.Sequential(
-                    nn.Conv2d(
-                        in_channels,
-                        out_channels=h_dim,
-                        kernel_size=3,
-                        stride=2,
-                        padding=1,
-                    ),
-                    nn.BatchNorm2d(h_dim),
-                    nn.LeakyReLU(),
-                )
-            )
-            in_channels = h_dim
-
-        self.encoder = nn.Sequential(*encoder_modules)
-        self.fc_mu_min = nn.Linear(hidden_dims[-1] * 4, latent_dim)
-        self.fc_mu_max = nn.Linear(hidden_dims[-1] * 4, latent_dim)
-
-        self.decoder_input = nn.Linear(latent_dim * 2, hidden_dims[-1] * 4)
-
-        decoder_modules = []
-        hidden_dims.reverse()
-        for i in range(len(hidden_dims) - 1):
-            decoder_modules.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(
-                        hidden_dims[i],
-                        hidden_dims[i + 1],
-                        kernel_size=3,
-                        stride=2,
-                        padding=1,
-                        output_padding=1,
-                    ),
-                    nn.BatchNorm2d(hidden_dims[i + 1]),
-                    nn.LeakyReLU(),
-                )
-            )
-
-        self.decoder = nn.Sequential(*decoder_modules)
-
-        self.final_layer = nn.Sequential(
-            nn.ConvTranspose2d(
-                hidden_dims[-1],
-                hidden_dims[-1],
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                output_padding=1,
-            ),
-            nn.BatchNorm2d(hidden_dims[-1]),
-            nn.LeakyReLU(),
-            nn.Conv2d(
-                hidden_dims[-1],
-                out_channels=3,
-                kernel_size=3,
-                padding=1,
-            ),
-            nn.Sigmoid(),
-        )
-
-    def encode(self, input):
-        result = self.encoder(input)
-        result = torch.flatten(result, start_dim=1)
-
-        mu_min = self.fc_mu_min(result)
-        mu_max = self.fc_mu_max(result)
-
-        return [mu_min, mu_max]
-
-    def decode(self, z):
-        result = self.decoder_input(z)
-        result = result.view(-1, self.hidden_dims[0], 2, 2)
-        result = self.decoder(result)
-        result = self.final_layer(result)
-        return result
-
-    def forward(self, input, **kwargs):
-        mu_min, mu_max = self.encode(input)
-        z = torch.cat([mu_min, mu_max], dim=-1)  # (batch_size, self.box_embed_dim)
-        return [self.decode(z), input, mu_min, mu_max]
+from models import VanillaVAE
 
 
 class PatchBoxEmbeddingsVAE(L.LightningModule):
@@ -476,16 +384,27 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         else:
             ssim_loss = torch.tensor(0.0, device=self.device)
 
-        # Calculate supervised contrastive loss if weight is provided
+        # Calculate supervised contrastive loss (intersection) if weight is provided
         if (
-            "supervised_contrastive_loss" in self.loss_weights
-            and self.loss_weights["supervised_contrastive_loss"] > 0
+            "supervised_contrastive_loss_intersection" in self.loss_weights
+            and self.loss_weights["supervised_contrastive_loss_intersection"] > 0
         ):
-            supervised_contrastive_loss = self.compute_supervised_contrastive_loss(
-                image_box_tensor, batch
+            supervised_contrastive_loss_intersection = (
+                self.compute_supervised_contrastive_loss_intersection(image_box_tensor, batch)
             )
         else:
-            supervised_contrastive_loss = torch.tensor(0.0, device=self.device)
+            supervised_contrastive_loss_intersection = torch.tensor(0.0, device=self.device)
+
+        # Calculate supervised contrastive loss (distance) if weight is provided
+        if (
+            "supervised_contrastive_loss_distance" in self.loss_weights
+            and self.loss_weights["supervised_contrastive_loss_distance"] > 0
+        ):
+            supervised_contrastive_loss_distance = (
+                self.compute_supervised_contrastive_loss_distance(image_box_tensor, batch)
+            )
+        else:
+            supervised_contrastive_loss_distance = torch.tensor(0.0, device=self.device)
 
         total_loss = (
             reconstruction_loss
@@ -495,7 +414,8 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             + min_side_regularization_loss
             + lpips_loss
             + ssim_loss
-            + supervised_contrastive_loss
+            + supervised_contrastive_loss_intersection
+            + supervised_contrastive_loss_distance
         )
 
         loss_dict = {
@@ -518,10 +438,18 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             loss_dict["ssim_loss_full_image"] = ssim_loss_full_image
 
         if (
-            "supervised_contrastive_loss" in self.loss_weights
-            and self.loss_weights["supervised_contrastive_loss"] > 0
+            "supervised_contrastive_loss_intersection" in self.loss_weights
+            and self.loss_weights["supervised_contrastive_loss_intersection"] > 0
         ):
-            loss_dict["supervised_contrastive_loss"] = supervised_contrastive_loss
+            loss_dict["supervised_contrastive_loss_intersection"] = (
+                supervised_contrastive_loss_intersection
+            )
+
+        if (
+            "supervised_contrastive_loss_distance" in self.loss_weights
+            and self.loss_weights["supervised_contrastive_loss_distance"] > 0
+        ):
+            loss_dict["supervised_contrastive_loss_distance"] = supervised_contrastive_loss_distance
 
         # Log number of valid patches if crop_objects is enabled
         if self.crop_objects:
@@ -659,7 +587,7 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
         penalty = penalty.sum(dim=-1).mean()
         return penalty
 
-    def compute_supervised_contrastive_loss(self, image_box_tensor, batch):
+    def compute_supervised_contrastive_loss_intersection(self, image_box_tensor, batch):
         """
         Compute supervised contrastive loss that penalizes intersection volume
         between boxes of different shapes (circle vs square).
@@ -720,9 +648,143 @@ class PatchBoxEmbeddingsVAE(L.LightningModule):
             # Sum all intersection volumes and penalize them
             total_intersection_volume = torch.stack(intersection_volumes).sum()
             supervised_contrastive_loss = (
-                total_intersection_volume * self.loss_weights["supervised_contrastive_loss"]
+                total_intersection_volume
+                * self.loss_weights["supervised_contrastive_loss_intersection"]
             )
         else:
             supervised_contrastive_loss = torch.tensor(0.0, device=self.device)
 
         return supervised_contrastive_loss
+
+    # def compute_supervised_contrastive_loss_distance(self, image_box_tensor, batch):
+    #     """
+    #     Compute supervised contrastive loss that pushes centroids of boxes
+    #     with different shapes (circle vs square) away from each other by
+    #     minimizing the negative squared distance between centroids.
+
+    #     If a margin is specified in loss_weights["supervised_contrastive_loss_distance_margin"],
+    #     pairs with distance >= margin have zero loss (already far enough apart).
+
+    #     Args:
+    #         image_box_tensor: BoxTensor of shape (batch_size, 2, embed_dim) representing
+    #                         the full image box embeddings
+    #         batch: Batch dictionary that should contain "metadata" with shape information
+
+    #     Returns:
+    #         loss: Scalar tensor representing the supervised contrastive loss (negative distance,
+    #               zero for pairs beyond the margin if margin is specified)
+    #     """
+    #     if "metadata" not in batch:
+    #         return torch.tensor(0.0, device=self.device)
+
+    #     batch_size = image_box_tensor.z.shape[0]
+    #     metadata = batch["metadata"]
+
+    #     # Extract shapes from metadata
+    #     # metadata is a dict with 'shape' key containing a list of shape strings
+    #     shapes = metadata["shape"]
+
+    #     # Find indices for circles and squares
+    #     circle_indices = [i for i, shape in enumerate(shapes) if shape == "circle"]
+    #     square_indices = [i for i, shape in enumerate(shapes) if shape == "square"]
+
+    #     if len(circle_indices) == 0 or len(square_indices) == 0:
+    #         # Need both shapes in the batch to compute contrastive loss
+    #         return torch.tensor(0.0, device=self.device)
+
+    #     # Compute centroids: (z + Z) / 2
+    #     circle_centroids = (
+    #         image_box_tensor.z[circle_indices] + image_box_tensor.Z[circle_indices]
+    #     ) / 2.0  # (num_circles, embed_dim)
+    #     square_centroids = (
+    #         image_box_tensor.z[square_indices] + image_box_tensor.Z[square_indices]
+    #     ) / 2.0  # (num_squares, embed_dim)
+
+    #     # Get margin value if provided, otherwise use infinity (no margin)
+    #     margin = self.loss_weights.get("supervised_contrastive_loss_distance_margin", float("inf"))
+    #     margin_squared = margin**2  # Compare squared distances to squared margin for efficiency
+
+    #     # Compute squared Euclidean distances between all circle-square centroid pairs
+    #     distances_squared = []
+    #     for i in range(len(circle_indices)):
+    #         for j in range(len(square_indices)):
+    #             # Compute squared Euclidean distance between centroids
+    #             diff = circle_centroids[i] - square_centroids[j]  # (embed_dim,)
+    #             dist_sq = torch.sum(diff**2)  # Scalar
+    #             distances_squared.append(dist_sq)
+
+    #     if len(distances_squared) > 0:
+    #         all_distances_sq = torch.stack(distances_squared)
+    #         # Apply margin: only penalize distances below the margin
+    #         # For distances >= margin, the loss contribution should be 0
+    #         # Use negative squared distance to maximize separation (minimizing this maximizes distance)
+    #         loss_per_pair = -all_distances_sq  # Negative to push apart
+    #         negative_margin_squared = -margin_squared
+    #         # Zero out loss for pairs where distance >= margin (already far enough apart)
+    #         # Compare loss (which is negative) to negative margin:
+    #         # If distance < margin: distance^2 < margin^2, so -distance^2 > -margin^2
+    #         #   This means loss_per_pair > negative_margin_squared, so we keep the loss
+    #         # If distance >= margin: distance^2 >= margin^2, so -distance^2 <= -margin^2
+    #         #   This means loss_per_pair <= negative_margin_squared, so we set to 0
+    #         loss_per_pair = torch.where(
+    #             loss_per_pair > negative_margin_squared,  # Keep loss when distance < margin
+    #             loss_per_pair,  # Keep negative distance if below margin (push apart)
+    #             torch.zeros_like(loss_per_pair),  # Zero loss if above margin (already far enough)
+    #         )
+    #         supervised_contrastive_loss = (
+    #             loss_per_pair.mean() * self.loss_weights["supervised_contrastive_loss_distance"]
+    #         )
+    #     else:
+    #         supervised_contrastive_loss = torch.tensor(0.0, device=self.device)
+
+    #     return supervised_contrastive_loss
+
+    def compute_supervised_contrastive_loss_distance(self, image_box_tensor, batch):
+        if "metadata" not in batch:
+            return torch.tensor(0.0, device=self.device)
+
+        metadata = batch["metadata"]
+        shapes = metadata["shape"]
+
+        # 1. Identification (Same as before)
+        circle_indices = [i for i, shape in enumerate(shapes) if shape == "circle"]
+        square_indices = [i for i, shape in enumerate(shapes) if shape == "square"]
+
+        if len(circle_indices) == 0 or len(square_indices) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        # 2. Compute Centroids (Same as before)
+        # Shape: (num_circles, embed_dim)
+        circle_centroids = (
+            image_box_tensor.z[circle_indices] + image_box_tensor.Z[circle_indices]
+        ) / 2.0
+        # Shape: (num_squares, embed_dim)
+        square_centroids = (
+            image_box_tensor.z[square_indices] + image_box_tensor.Z[square_indices]
+        ) / 2.0
+
+        # 3. Vectorized Distance Calculation (Replaces nested loops)
+        # We want pairwise distances between all circles and all squares.
+        # Broadcasting: (N, 1, D) - (1, M, D) -> (N, M, D)
+        diff = circle_centroids.unsqueeze(1) - square_centroids.unsqueeze(0)
+
+        # Squared Euclidean distance
+        # Shape: (num_circles, num_squares)
+        dist_sq = torch.sum(diff**2, dim=-1)
+
+        # 4. Margin Logic (Corrected to Hinge Loss)
+        margin = self.loss_weights.get("supervised_contrastive_loss_distance_margin", 1.0)
+
+        # Logic: We want dist_sq >= margin^2.
+        # Loss = ReLU(margin^2 - dist_sq)
+        # If dist_sq is small (0), Loss is high (margin^2).
+        # If dist_sq > margin^2, Loss is 0.
+        margin_sq = margin**2
+
+        # This creates a smooth gradient pushing them apart until they hit the margin
+        hinge_loss = F.relu(margin_sq - dist_sq)
+
+        # 5. Aggregate and Weight
+        loss = hinge_loss.mean() * self.loss_weights["supervised_contrastive_loss_distance"]
+
+        return loss
