@@ -1,6 +1,6 @@
 from .HyperNetworkSpatialEncoder import HyperNetworkSpatialEncoder
 from .PESpatialEncoder import PESpatialEncoder
-from .BoxEmbeddings import PatchBoxEmbeddingsVAE, PatchBoxEmbeddings
+from .BoxEmbeddings import PatchBoxEmbeddingsVAE, PatchBoxEmbeddings, HierarchicalBoxEmbeddingsVAE
 
 
 def get_module(config):
@@ -12,5 +12,7 @@ def get_module(config):
         return PatchBoxEmbeddings(config)
     elif model_type == "PatchBoxEmbeddingsVAE":
         return PatchBoxEmbeddingsVAE(config)
+    elif model_type == "HierarchicalBoxEmbeddingsVAE":
+        return HierarchicalBoxEmbeddingsVAE(config)
     else:
         raise ValueError(f"Model type {model_type} not implemented.")

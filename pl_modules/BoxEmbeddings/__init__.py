@@ -1,2 +1,3 @@
 from .PatchBoxEmbeddingsVAE import PatchBoxEmbeddingsVAE
 from .PatchBoxEmbeddings import PatchBoxEmbeddings
+from .HierarchicalBoxEmbeddingsVAE import HierarchicalBoxEmbeddingsVAE

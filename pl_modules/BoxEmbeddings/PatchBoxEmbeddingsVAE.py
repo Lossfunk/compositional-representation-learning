@@ -18,7 +18,7 @@ from box_embeddings.modules.regularization import (
 )
 
 from .utils import create_reconstruction_visualization
-from models import VanillaVAE
+from .vae import VanillaVAE
 
 
 class PatchBoxEmbeddingsVAE(L.LightningModule):

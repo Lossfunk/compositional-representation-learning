@@ -1,0 +1,57 @@
+model:
+  type: "HierarchicalBoxEmbeddingsVAE"
+  config:
+    # Box Embedding Dimension (Mu + Beta = 2x this params)
+    # 64 is a sweet spot for box embeddings to allow meaningful intersections
+    embed_dim: 3
+
+    # Encoder/Decoder Architecture
+    # Defines the depth for a 64x64 input resolution
+    hidden_dims: [32, 64, 128, 256]
+
+    # Patching Strategy
+    # (4, 4) splits a 64x64 image into 16 patches of size 16x16
+    grid_size: [4, 4]
+    input_resolution: [64, 64]
+
+    prior_config:
+      # Level 0 (Root): Matches Patches (Visual Primitives like edges, textures)
+      # Level 1: Matches Full Images (Object Concepts built from primitives)
+      # We define 64 primitive concepts and 128 object concepts
+      boxes_per_level: [16, 4]
+
+    loss_weights:
+      # Reconstruction often needs higher weight to ensure image quality
+      reconstruction: 10.0
+
+      # The "Pull" (Clustering) loss
+      pull: 1.0
+
+      # Entropy Regularization (Prevents cluster collapse)
+      entropy: 0.05
+
+      # Geometric Consistency (Whole-Part constraint)
+      consistency: 1.0
+
+# Standard PyTorch Lightning Trainer params
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size: [64, 64]
+      shapes: ["circle", "square"]
+      colors: ["red"]
+      num_samples: 1000
+      return_metadata: True
+      center_range: [16, 48]
+      size_range: [10, 30]
+    dataloader_config:
+      batch_size: 32
+      shuffle: True
+
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001
