@@ -131,6 +131,9 @@ class BoxEmbedVAE(nn.Module):
         self.fc_beta_min = nn.Linear(self.flatten_dim, latent_dim)
         self.fc_beta_max = nn.Linear(self.flatten_dim, latent_dim)
 
+        nn.init.constant_(self.fc_beta_min.bias, -3.0)
+        nn.init.constant_(self.fc_beta_max.bias, -3.0)
+
         self.decoder_input = nn.Linear(latent_dim * 2, self.flatten_dim)
 
         decoder_modules = []
@@ -160,12 +163,16 @@ class BoxEmbedVAE(nn.Module):
         bottleneck = self.encoder(input)
         bottleneck_flat = torch.flatten(bottleneck, start_dim=1)
 
-        batch_mu_min = self.fc_mu_min(bottleneck_flat)
-        batch_mu_delta = self.fc_mu_delta(bottleneck_flat)
-        batch_mu_max = batch_mu_min + F.softplus(batch_mu_delta)
+        batch_mu_min = torch.sigmoid(self.fc_mu_min(bottleneck_flat)) * 0.5
+        batch_mu_delta = F.softplus(self.fc_mu_delta(bottleneck_flat))
+        batch_mu_max = torch.clamp(batch_mu_min + batch_mu_delta, max = 2.0)
 
-        batch_beta_min = F.softplus(self.fc_beta_min(bottleneck_flat))
-        batch_beta_max = F.softplus(self.fc_beta_max(bottleneck_flat))
+        batch_beta_min = F.softplus(self.fc_beta_min(bottleneck_flat)) + 1e-4
+        batch_beta_max = F.softplus(self.fc_beta_max(bottleneck_flat)) + 1e-4
+
+        # beta_scale = 0.05
+        # batch_beta_min = torch.sigmoid(self.fc_beta_min(bottleneck_flat)) * beta_scale + 1e-4
+        # batch_beta_max = torch.sigmoid(self.fc_beta_max(bottleneck_flat)) * beta_scale + 1e-4
 
         return batch_mu_min, batch_mu_max, batch_beta_min, batch_beta_max
 
