@@ -99,11 +99,12 @@ class VanillaVAE(nn.Module):
 
 
 class BoxEmbedVAE(nn.Module):
-    def __init__(self, latent_dim, hidden_dims, input_resolution=(64, 64)):
+    def __init__(self, latent_dim, hidden_dims, input_resolution=(64, 64), beta_scale=0.2):
         super(BoxEmbedVAE, self).__init__()
 
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
+        self.beta_scale = beta_scale
         
         # --- Encoder ---
         encoder_modules = []
@@ -163,16 +164,12 @@ class BoxEmbedVAE(nn.Module):
         bottleneck = self.encoder(input)
         bottleneck_flat = torch.flatten(bottleneck, start_dim=1)
 
-        batch_mu_min = torch.sigmoid(self.fc_mu_min(bottleneck_flat)) * 0.5
+        batch_mu_min = torch.sigmoid(self.fc_mu_min(bottleneck_flat))
         batch_mu_delta = F.softplus(self.fc_mu_delta(bottleneck_flat))
         batch_mu_max = torch.clamp(batch_mu_min + batch_mu_delta, max = 2.0)
 
-        batch_beta_min = F.softplus(self.fc_beta_min(bottleneck_flat)) + 1e-4
-        batch_beta_max = F.softplus(self.fc_beta_max(bottleneck_flat)) + 1e-4
-
-        # beta_scale = 0.05
-        # batch_beta_min = torch.sigmoid(self.fc_beta_min(bottleneck_flat)) * beta_scale + 1e-4
-        # batch_beta_max = torch.sigmoid(self.fc_beta_max(bottleneck_flat)) * beta_scale + 1e-4
+        batch_beta_min = torch.sigmoid(self.fc_beta_min(bottleneck_flat)) * self.beta_scale + 1e-6
+        batch_beta_max = torch.sigmoid(self.fc_beta_max(bottleneck_flat)) * self.beta_scale + 1e-6
 
         return batch_mu_min, batch_mu_max, batch_beta_min, batch_beta_max
 
@@ -187,18 +184,6 @@ class BoxEmbedVAE(nn.Module):
     def forward(self, input, **kwargs):
         batch_size = input.shape[0]
         batch_mu_min, batch_mu_max, batch_beta_min, batch_beta_max = self.encode(input)
-
-        # batch_box_dists = []
-        # batch_samples = []
-        # for datapoint_idx in batch_size:
-        #     datapoint_box_dist = BoxEmbeddingDistribution(batch_mu_min[datapoint_idx], batch_mu_max[datapoint_idx], batch_beta_min[datapoint_idx], batch_beta_max[datapoint_idx])
-        #     datapoint_sample = datapoint_box_dist.sample()
-            
-        #     batch_box_dists.append(datapoint_box_dist)
-        #     batch_samples.append(datapoint_sample)
-
-        # batch_samples = torch.stack(batch_samples, dim = 0)
-        # reconstruction = self.decode(batch_samples)
 
         batch_box_dists = BoxEmbeddingDistribution(batch_mu_min, batch_mu_max, batch_beta_min, batch_beta_max)
         batch_samples_min, batch_samples_max = batch_box_dists.sample()

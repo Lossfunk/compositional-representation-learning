@@ -1,3 +1,4 @@
+import random
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -20,16 +21,21 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         self.hidden_dims = self.model_config["hidden_dims"]
         self.grid_size = self.model_config["grid_size"]
         self.input_resolution = self.model_config["input_resolution"]
+        self.beta_scale = self.model_config["beta_scale"]
+        self.crop_padding_range = self.model_config["crop_padding_range"]
         
         self.vae = BoxEmbedVAE(
             latent_dim=self.embed_dim,
             hidden_dims=self.hidden_dims,
-            input_resolution=self.input_resolution
+            input_resolution=self.input_resolution,
+            beta_scale = self.beta_scale
         )
 
         self.prior = HierarchicalBoxEmbeddingsPrior(
             boxes_per_level=self.model_config["prior_config"]["boxes_per_level"],
-            embed_dim=self.embed_dim
+            embed_dim=self.embed_dim,
+            beta_scale = self.beta_scale,
+            init_config=self.model_config["prior_config"]["init_config"]
         )
 
         self.loss_weights = self.model_config["loss_weights"]
@@ -39,9 +45,49 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
 
         self.viz_datapoint = None
 
+    def crop_to_content(self, images, masks):
+        
+        cropped_batch = []
+        H, W = images.shape[2], images.shape[3]
+        
+        for i in range(images.shape[0]):
+            img = images[i] # (C, H, W)
+            mask = masks[i] # (H, W)
+            
+            non_zero_indices = torch.nonzero(mask)
+            
+            if non_zero_indices.size(0) == 0:
+                cropped_batch.append(img)
+                continue
+                
+            y_min = torch.min(non_zero_indices[:, 0]).item()
+            y_max = torch.max(non_zero_indices[:, 0]).item()
+            x_min = torch.min(non_zero_indices[:, 1]).item()
+            x_max = torch.max(non_zero_indices[:, 1]).item()
+
+            y_min_pad = max(0, y_min - random.randint(self.crop_padding_range[0], self.crop_padding_range[0]))
+            y_max_pad = min(H - 1, y_max + random.randint(self.crop_padding_range[0], self.crop_padding_range[0]))
+            x_min_pad = max(0, x_min - random.randint(self.crop_padding_range[0], self.crop_padding_range[0]))
+            x_max_pad = min(W - 1, x_max + random.randint(self.crop_padding_range[0], self.crop_padding_range[0]))
+            
+            crop = img[:, y_min_pad : y_max_pad + 1, x_min_pad : x_max_pad + 1]
+            
+            crop_resized = F.interpolate(
+                crop.unsqueeze(0), 
+                size=self.input_resolution, 
+                mode='bilinear', 
+                align_corners=False
+            ).squeeze(0)
+            
+            cropped_batch.append(crop_resized)
+            
+        return torch.stack(cropped_batch)
+
     def forward(self, x):
         images = x["images"]
-        batch_size = images.shape[0]
+        masks = x["object_masks"]
+        
+        images = self.crop_to_content(images, masks)
 
         patches = self.divide_image_into_patches(images) # (B, NumPatches, C, H_p, W_p)
         B, N, C, Hp, Wp = patches.shape
@@ -63,9 +109,6 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
 
         all_box_dists = vae_out["box_distributions"]
 
-        # patch_box_dists = vae_out["box_distributions"][:patch_end_idx]
-        # full_image_box_dists = vae_out["box_distributions"][patch_end_idx:]
-
         patch_box_dists = BoxEmbeddingDistribution(
             all_box_dists.mu_min[:patch_end_idx],
             all_box_dists.mu_max[:patch_end_idx],
@@ -84,18 +127,19 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         full_image_samples = vae_out["samples"][patch_end_idx:]
         
         return {
+            "images": images,
             "patch_reconstruction": patch_reconstruction,
             "full_image_reconstruction": full_image_reconstruction,
             "original_patches_resized": patches_resized,
             "patch_box_dists": patch_box_dists,
             "full_image_box_dists": full_image_box_dists,
             "patch_samples": patch_samples,
-            "full_image_samples": full_image_samples
+            "full_image_samples": full_image_samples,
         }
 
     def training_step(self, batch, batch_idx):
         output = self(batch)
-        images = batch["images"]
+        images = output["images"]
 
         patch_reconstruction = output["patch_reconstruction"]
         full_image_reconstruction = output["full_image_reconstruction"]
@@ -169,9 +213,35 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         intersection_dist = BoxEmbeddingDistribution(incl_mu_min, incl_mu_max, incl_beta_min, incl_beta_max)
         log_vol_intersection = bessel_volume(intersection_dist, volume_temp=0.1, log_scale=True) # (B,)
         
-        # We use ReLU because numerical noise might make intersection slightly larger, 
-        # but theoretically Vol(Subset) <= Vol(Set).
         inclusion_loss = F.relu(log_vol_img - log_vol_intersection).mean()
+
+
+        # ----- Exclusion Loss -----
+        flat_l1_dist = BoxEmbeddingDistribution(
+            full_image_prior_box_dists.mu_min.squeeze(0),
+            full_image_prior_box_dists.mu_max.squeeze(0),
+            full_image_prior_box_dists.beta_min.squeeze(0),
+            full_image_prior_box_dists.beta_max.squeeze(0)
+        )
+        
+        flat_l0_dist = BoxEmbeddingDistribution(
+            patch_prior_box_dists.mu_min.squeeze(0),
+            patch_prior_box_dists.mu_max.squeeze(0),
+            patch_prior_box_dists.beta_min.squeeze(0),
+            patch_prior_box_dists.beta_max.squeeze(0)
+        )
+
+        # 2. Compute Intersection of every L1 box with every L0 box
+        # Output Shape: (Num_L1, Num_L0, D)
+        all_pairs_inter = pairwise_gumbel_intersection(flat_l1_dist, flat_l0_dist)
+        
+        # 3. Compute Volume (Linear Scale)
+        # Output Shape: (Num_L1, Num_L0)
+        all_pairs_log_vol = bessel_volume(all_pairs_inter, volume_temp=0.1, log_scale=True)
+        all_pairs_vol = torch.exp(all_pairs_log_vol)
+        adj_logits = self.prior.adjacency_logits[0] # Shape: (Num_L1, Num_L0)
+        adj_weights = torch.sigmoid(adj_logits)
+        exclusion_loss = ((1.0 - adj_weights.detach().unsqueeze(0)) * all_pairs_vol).mean()
 
 
         # ----- Reconstruction Loss -----
@@ -192,6 +262,44 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         recon_loss_patch_ssim = 1 - self.ssim_loss_fn(patch_reconstruction, patches_target)
 
 
+        # ----- Hebbian Loss -----
+        B = full_image_cluster_assignment_probs.shape[0]
+        N_patches = patch_cluster_assignment_probs.shape[0] // B
+        Num_L0 = patch_cluster_assignment_probs.shape[1]
+        
+        patch_probs_reshaped = patch_cluster_assignment_probs.view(B, N_patches, Num_L0) # (B, N_p, N_l0)
+        full_image_probs = full_image_cluster_assignment_probs # (B, N_l1)
+
+        l0_indices = torch.argmax(patch_probs_reshaped, dim=-1) # (B, N_p)
+        l1_indices = torch.argmax(full_image_probs, dim = -1) # (B,)
+        l1_indices_expanded = l1_indices.unsqueeze(1).expand(-1, N_patches) # (B, N_p)
+
+        rows = l1_indices_expanded.reshape(-1)
+        cols = l0_indices.reshape(-1)
+
+        target_adj = torch.zeros_like(self.prior.adjacency_logits[0], device = self.device) # (N_l1, N_l0)
+        # target_adj[rows, cols] = 1.0
+        target_adj.index_put_((rows, cols), torch.tensor(1.0, device=self.device))
+        N_l1, N_l0 = target_adj.shape
+
+        active_l1_mask = torch.zeros(N_l1, dtype=torch.bool, device=self.device)
+        active_l1_mask[l1_indices] = True
+        
+        # Current Logits: (Num_L1, Num_L0)
+        adj_logits = self.prior.adjacency_logits[0]
+        
+        # Select only the active rows
+        active_logits = adj_logits[active_l1_mask]      # (Num_Active, Num_L0)
+        active_targets = target_adj[active_l1_mask]     # (Num_Active, Num_L0)
+        
+        if active_logits.shape[0] > 0:
+            hebbian_loss = F.binary_cross_entropy_with_logits(active_logits, active_targets)
+        else:
+            hebbian_loss = 0.0
+
+        hebbian_weight = 100.0 * min(1.0, self.current_epoch / 50.0)
+
+
         # ----- Regularization Losses -----
         
         # --- Uniform Prior Loss ---
@@ -201,19 +309,44 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         # --- Disjoint Prior Loss ---
         loss_disjoint_full = self.compute_pairwise_disjoint_loss(prior_box_dists[1])
 
+        # --- Entropy Loss ---
+        adj_logits = self.prior.adjacency_logits[0]
+        adj_probs = torch.sigmoid(adj_logits)
+        
+        # Standard Entropy: -p*log(p) - (1-p)*log(1-p)
+        entropy = -adj_probs * torch.log(adj_probs + 1e-10) - (1 - adj_probs) * torch.log(1 - adj_probs + 1e-10)
+        entropy_loss = entropy.mean()
 
+        # --- l0 and l1 assignment entropy ---
+        avg_l0_usage = patch_cluster_assignment_probs.mean(dim = 0)
+        l0_entropy = -torch.sum(avg_l0_usage * torch.log(avg_l0_usage + 1e-10))
+        l0_entropy_loss = -l0_entropy
+
+        avg_l1_usage = full_image_cluster_assignment_probs.mean(dim = 0)
+        l1_entropy = -torch.sum(avg_l1_usage * torch.log(avg_l1_usage + 1e-10))
+        l1_entropy_loss = -l1_entropy
+
+        # --- l0 box volume penalty ---
+        l0_vol = bessel_volume(flat_l0_dist, log_scale=False)
+        l0_vol_penalty = l0_vol.mean() * 10.0
 
         total_loss = (
-            self.loss_weights["patch_pull_loss"] * patch_cluster_pull_loss +
-            self.loss_weights["full_image_pull_loss"] * full_image_cluster_pull_loss +
-            self.loss_weights["inclusion_loss"] * inclusion_loss +
             self.loss_weights["patch_mse_loss"] * recon_loss_patch_mse +
             self.loss_weights["patch_ssim_loss"] * recon_loss_patch_ssim +
             self.loss_weights["full_image_mse_loss"] * recon_loss_full_mse +
             self.loss_weights["full_image_ssim_loss"] * recon_loss_full_ssim +
+            self.loss_weights["patch_pull_loss"] * patch_cluster_pull_loss +
+            self.loss_weights["full_image_pull_loss"] * full_image_cluster_pull_loss +
+            self.loss_weights["inclusion_loss"] * inclusion_loss +
+            self.loss_weights["exclusion_loss"] * exclusion_loss +
             self.loss_weights["loss_uniform_patch"] * loss_uniform_patch + 
             self.loss_weights["loss_uniform_full"] * loss_uniform_full + 
-            self.loss_weights["loss_disjoint_full"] * loss_disjoint_full
+            self.loss_weights["loss_disjoint_full"] * loss_disjoint_full +
+            self.loss_weights["entropy_loss"] * entropy_loss +
+            self.loss_weights["hebbian_loss"] * hebbian_loss +
+            self.loss_weights["l0_entropy_loss"] * l0_entropy_loss +
+            self.loss_weights["l1_entropy_loss"] * l1_entropy_loss +
+            self.loss_weights["l0_vol_penalty"] * l0_vol_penalty
         )
 
         loss_dict = {
@@ -221,149 +354,21 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
             "patch_pull_loss": patch_cluster_pull_loss,
             "full_image_pull_loss": full_image_cluster_pull_loss,
             "inclusion_loss": inclusion_loss,
+            "exclusion_loss": exclusion_loss,
             "patch_mse_loss": recon_loss_patch_mse,
             "patch_ssim_loss": recon_loss_patch_ssim,
             "full_image_mse_loss": recon_loss_full_mse,
             "full_image_ssim_loss": recon_loss_full_ssim,
             "loss_uniform_patch": loss_uniform_patch,
             "loss_uniform_full": loss_uniform_full,
-            "loss_disjoint_full": loss_disjoint_full
+            "loss_disjoint_full": loss_disjoint_full,
+            "entropy_loss": entropy_loss,
+            "hebbian_loss": hebbian_loss,
+            "l0_entropy_loss": l0_entropy_loss,
+            "l1_entropy_loss": l1_entropy_loss,
+            "l0_vol_penalty": l0_vol_penalty
         }
         self.log_dict(loss_dict, prog_bar=True, on_epoch=True)
-
-        # # ----- PULL LOSS COMPUTATION ----- 
-        # patch_log_vol = soft_volume(patch_box_dists, log_scale=True).unsqueeze(1) # (B*N, 1)
-        # patch_prior_log_vol = soft_volume(patch_prior_box_dists, log_scale = True).unsqueeze(0) # (1, M)
-        # patch_intersection_box_dists = pairwise_gumbel_intersection(patch_box_dists, patch_prior_box_dists)
-        # patch_intersection_log_vol = soft_volume(patch_intersection_box_dists, log_scale = True) # (B*N, M)
-
-        # patch_log_likelihoods = patch_intersection_log_vol - patch_log_vol# - patch_prior_log_vol
-        # patch_assignment_weights = F.softmax(patch_log_likelihoods, dim = 1) # (B*N, M)
-        # patch_assignment_weights = patch_assignment_weights.detach()
-
-        # patch_containment_log_ratio = patch_intersection_log_vol - patch_log_vol # (B*N, M)
-        # patch_pull_loss = torch.mean(-torch.sum(patch_assignment_weights * patch_containment_log_ratio, dim=1))
-
-
-        # full_image_log_vol = soft_volume(full_image_box_dists, log_scale=True).unsqueeze(1)
-        # full_image_prior_log_vol = soft_volume(full_image_prior_box_dists, log_scale=True).unsqueeze(0)
-        # full_intersection_box_dists = pairwise_gumbel_intersection(full_image_box_dists, full_image_prior_box_dists)
-        # full_intersection_log_vol = soft_volume(full_intersection_box_dists, log_scale=True)
-
-        # full_log_likelihoods = full_intersection_log_vol - full_image_log_vol# - full_image_prior_log_vol
-        # full_assignment_weights = F.softmax(full_log_likelihoods, dim=1) # (B, K)
-        # full_assignment_weights = full_assignment_weights.detach()
-
-        # full_containment_log_ratio = full_intersection_log_vol - full_image_log_vol
-        # full_image_pull_loss = torch.mean(-torch.sum(full_assignment_weights * full_containment_log_ratio, dim=1))
-
-        # total_pull_loss = patch_pull_loss + full_image_pull_loss
-
-        
-        # # ----- Assignment Weights Regularization -----
-        # patch_avg_usage = torch.mean(patch_assignment_weights, dim=0)
-        # patch_entropy_loss = torch.sum(patch_avg_usage * torch.log(patch_avg_usage + 1e-20))
-        
-        # full_avg_usage = torch.mean(full_assignment_weights, dim=0)
-        # full_entropy_loss = torch.sum(full_avg_usage * torch.log(full_avg_usage + 1e-20))
-        
-        # total_entropy_loss = patch_entropy_loss + full_entropy_loss
-
-
-        # # ----- Consistency Loss -----
-        # B = full_image_box_dists.mu_min.shape[0]
-        # N = patch_box_dists.mu_min.shape[0] // B
-        # D = patch_box_dists.mu_min.shape[-1]
-        
-        # # def reshape_dist(dist, b, n, d):
-        # #     return BoxEmbeddingDistribution(
-        # #         dist.mu_min.view(b, n, d).permute(1, 0, 2),
-        # #         dist.mu_max.view(b, n, d).permute(1, 0, 2),
-        # #         dist.beta_min.view(b, n, d).permute(1, 0, 2),
-        # #         dist.beta_max.view(b, n, d).permute(1, 0, 2)
-        # #     )
-
-        # # reshaped_patches = reshape_dist(patch_box_dists, B, N, D)
-        
-        # # patch_weights = torch.ones(N, B, 1, device=self.device)
-        # # combined_patch_dist = soft_intersection(reshaped_patches, patch_weights)
-        
-        # # consistency_int_dist = elementwise_gumbel_intersection(full_image_box_dists, combined_patch_dist)
-        
-        # # log_vol_full = soft_volume(full_image_box_dists, log_scale=True) # (B,)
-        # # log_vol_consistency_int = soft_volume(consistency_int_dist, log_scale=True) # (B,)
-
-        # # consistency_log_ratio = log_vol_consistency_int - log_vol_full
-        # # consistency_loss = torch.mean(-consistency_log_ratio)
-
-        # full_mu_min_exp = full_image_box_dists.mu_min.repeat_interleave(N, dim=0)
-        # full_mu_max_exp = full_image_box_dists.mu_max.repeat_interleave(N, dim=0)
-        # full_beta_min_exp = full_image_box_dists.beta_min.repeat_interleave(N, dim=0)
-        # full_beta_max_exp = full_image_box_dists.beta_max.repeat_interleave(N, dim=0)
-        
-        # expanded_full_dist = BoxEmbeddingDistribution(
-        #     full_mu_min_exp, full_mu_max_exp, full_beta_min_exp, full_beta_max_exp
-        # )
-
-        # # 2. Intersect "Patch" with "Full Image"
-        # # If Patch is inside Full Image, the Intersection should be exactly the Patch.
-        # consistency_int_dist = pairwise_gumbel_intersection(patch_box_dists, expanded_full_dist)
-        # # Note: pairwise returns (A, B, D), but here we want elementwise since indices are aligned.
-        # # But wait, pairwise computes A x B. We just want elementwise (Patch_i with Full_i_expanded).
-        # consistency_int_dist = elementwise_gumbel_intersection(patch_box_dists, expanded_full_dist)
-
-        # # 3. Containment Ratio
-        # # We want log(Vol(Intersection)) approx equals log(Vol(Patch))
-        # log_vol_patch = soft_volume(patch_box_dists, log_scale=True)
-        # log_vol_int = soft_volume(consistency_int_dist, log_scale=True)
-
-        # # Minimize the difference (Negative Log Ratio)
-        # consistency_log_ratio = log_vol_int - log_vol_patch
-        # consistency_loss = torch.mean(-consistency_log_ratio)
-
-        # # ----- Reconstruction Loss -----
-        # recon_loss_full_mse = F.mse_loss(full_image_reconstruction, images)
-        # recon_loss_full_ssim = 1 - self.ssim_loss_fn(full_image_reconstruction, images)
-        # recon_loss_full = recon_loss_full_mse*10 + recon_loss_full_ssim
-        # recon_loss_full = recon_loss_full * 10
-
-        # patches = self.divide_image_into_patches(images) # (B, N, C, Hp, Wp)
-        # B, N, C, Hp, Wp = patches.shape
-        # patches_flat = patches.view(B * N, C, Hp, Wp)
-        
-        # # Resize targets to VAE resolution (e.g. 64x64)
-        # patches_target = F.interpolate(
-        #     patches_flat, 
-        #     size=self.input_resolution, 
-        #     mode='bilinear', 
-        #     align_corners=False
-        # )
-
-        # recon_loss_patch_mse = F.mse_loss(patch_reconstruction, patches_target)
-        # recon_loss_patch_ssim = 1 - self.ssim_loss_fn(patch_reconstruction, patches_target)
-        # recon_loss_patch = recon_loss_patch_mse*10 + recon_loss_patch_ssim
-
-        # total_recon_loss = recon_loss_full + recon_loss_patch
-
-        # weights = self.loss_weights
-        # total_loss = (weights["reconstruction"] * total_recon_loss) + \
-        #              (weights["pull"] * total_pull_loss) + \
-        #              (weights["entropy"] * total_entropy_loss) + \
-        #              (weights["consistency"] * consistency_loss)
-
-        # # self.log("train/loss", total_loss)
-        # # self.log("train/recon_loss", total_recon_loss)
-        # # self.log("train/pull_loss", total_pull_loss)
-        # # self.log("train/entropy_loss", total_entropy_loss)
-        # # self.log("train/consistency_loss", consistency_loss)
-
-        # loss_dict = {
-        #     "total_loss": total_loss,
-        #     "total_recon_loss": total_recon_loss,
-        #     "total_pull_loss": total_pull_loss,
-        #     "total_entropy_loss": total_entropy_loss,
-        #     "consistency_loss": consistency_loss
-        # }
 
         if self.viz_datapoint is None:
             N = self.grid_size[0] * self.grid_size[1]
@@ -407,22 +412,11 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         return BoxEmbeddingDistribution(new_mu_min, new_mu_max, new_beta_min, new_beta_max)
 
     def compute_marginal_entropy_loss(self, assignment_probs):
-        """
-        Encourages the batch to utilize all clusters equally (Uniform Prior).
-        Args:
-            assignment_probs: (Batch, Num_Clusters) - Softmaxed probabilities p(c|x)
-        """
-        # 1. Compute Marginal Probability (Average usage across batch)
-        # Shape: (Num_Clusters,)
         avg_probs = assignment_probs.mean(dim=0)
         
-        # 2. Compute KL Divergence to Uniform
-        # Target is 1/K for all clusters
         num_clusters = avg_probs.shape[0]
         target_probs = torch.ones_like(avg_probs) / num_clusters
         
-        # KL(P || Q) = sum(p * log(p/q))
-        # We add epsilon for numerical stability
         kl_div = torch.sum(avg_probs * torch.log((avg_probs + 1e-10) / (target_probs + 1e-10)))
         
         return kl_div
@@ -473,17 +467,10 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         if H % grid_h != 0 or W % grid_w != 0:
             raise ValueError("Image dimensions must be divisible by grid size.")
 
-        # 1. Split H and W dimensions
         patches = images.view(
             B, C, grid_h, patch_h, grid_w, patch_w
         ) 
-        
-        # 2. Permute to group grid dimensions and channel/spatial dims
-        # (B, grid_h, grid_w, C, patch_h, patch_w)
         patches = patches.permute(0, 2, 4, 1, 3, 5)  
-        
-        # 3. Collapse grid_h and grid_w into 'Num_Patches' (N)
-        # Final Shape: (B, N, C, patch_h, patch_w)
         patches = patches.reshape(B, -1, C, patch_h, patch_w)
         
         return patches
@@ -502,27 +489,74 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
 
     def on_train_epoch_end(self):
         if self.viz_datapoint is not None:
-            # Create the figure
             fig = self.create_reconstruction_figure(
                 self.viz_datapoint, 
                 self.grid_size, 
                 self.current_epoch
             )
+            self.logger.experiment.log({"reconstruction_visualization matrix": fig})
             
-            # Log to WandB (or whatever logger is being used)
-            if self.logger is not None:
-                # Check if using WandB
-                if hasattr(self.logger.experiment, "log"):
-                     self.logger.experiment.log({"reconstruction_visualization": fig})
-                # Check if using TensorBoard
-                elif hasattr(self.logger.experiment, "add_figure"):
-                    self.logger.experiment.add_figure(
-                        "reconstruction_visualization", fig, self.current_epoch
-                    )
-            
-            # Cleanup
             self.viz_datapoint = None
             plt.close(fig)
+        
+        with torch.no_grad():
+            prior_dists = self.prior()
+            level0_dist = prior_dists[0]
+            level1_dist = prior_dists[1]
+
+            adj_logits = self.prior.adjacency_logits[0]
+            adj_weights = torch.sigmoid(adj_logits).detach().cpu().numpy()
+            
+            fig_adj = plt.figure(figsize=(10, 8))
+            plt.imshow(adj_weights, aspect='auto', cmap='viridis', vmin=0, vmax=1)
+            plt.colorbar(label="Connection Probability")
+            plt.xlabel(f"Level 0 Boxes (Patches) [Count: {adj_weights.shape[1]}]")
+            plt.ylabel(f"Level 1 Boxes (Images) [Count: {adj_weights.shape[0]}]")
+            plt.title(f"Learned Adjacency (Epoch {self.current_epoch})")
+            plt.tight_layout()
+            self.logger.experiment.log({"adjacency matrix": fig_adj})
+
+
+            recon_l0 = self.decode_prior_boxes(level0_dist)
+            recon_l1 = self.decode_prior_boxes(level1_dist)
+            fig_l0 = self.create_grid_figure(recon_l0, f"Level 0 (Patches) Prior - Epoch {self.current_epoch}")
+            fig_l1 = self.create_grid_figure(recon_l1, f"Level 1 (Full Images) Prior - Epoch {self.current_epoch}")
+            self.logger.experiment.log({"Level 0 Prior Reconstructions": fig_l0})
+            self.logger.experiment.log({"Level 1 Prior Reconstructions": fig_l1})
+
+            plt.close(fig_adj)
+            plt.close(fig_l0)
+            plt.close(fig_l1)
+            
+
+    def decode_prior_boxes(self, box_dist):
+        """
+        Helper to decode the canonical representation (mean) of a box distribution.
+        """
+        mu_min = box_dist.mu_min.squeeze(0)
+        mu_max = box_dist.mu_max.squeeze(0)
+        
+        z = torch.cat([mu_min, mu_max], dim=-1)
+        
+        return self.vae.decode(z)
+
+    @staticmethod
+    def create_grid_figure(images, title):
+        """Helper to create a simple grid figure"""
+
+        max_imgs = 64
+        if images.shape[0] > max_imgs:
+            images = images[:max_imgs]
+            
+        grid = torchvision.utils.make_grid(images, nrow=8, padding=2)
+        grid_np = grid.permute(1, 2, 0).cpu().numpy()
+        
+        fig = plt.figure(figsize=(10, 10))
+        plt.imshow(np.clip(grid_np, 0, 1))
+        plt.title(title)
+        plt.axis("off")
+        plt.tight_layout()
+        return fig
 
     @staticmethod
     def create_reconstruction_figure(data, grid_size, epoch):
@@ -534,9 +568,6 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         
         input_patches = data["input_patches"]
         recon_patches = data["recon_patches"]
-        
-        # Unnormalize if your images are [-1, 1], otherwise assume [0, 1]
-        # Assuming [0, 1] based on Sigmoid in decoder
         
         fig = plt.figure(figsize=(12, 8))
         plt.suptitle(f"Epoch {epoch} Reconstruction", fontsize=16)
@@ -554,7 +585,6 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         ax2.axis("off")
 
         # 3. Input Patches Grid
-        # Create a grid of images
         grid_in = torchvision.utils.make_grid(input_patches, nrow=grid_size[1], padding=2)
         grid_in = grid_in.permute(1, 2, 0).numpy()
         
@@ -575,183 +605,13 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         plt.tight_layout()
         return fig
 
-
-
-
-
-# class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
-#     def __init__(self, config):
-#         super(HierarchicalBoxEmbeddingsVAE, self).__init__()
-#         self.config = config
-
-#         self.embed_dim = config["model"]["config"]["embed_dim"]
-#         self.hidden_dims = config["model"]["config"]["hidden_dims"]
-#         self.boxes_per_level = config["model"]["config"]["boxes_per_level"]
-#         self.grid_size = config["model"]["config"]["grid_size"]
-#         self.image_size = config["data"]["train"]["config"]["image_size"]
-#         self.gumbel_temp = config["model"]["config"]["gumbel_temp"]
-
-#         self.vae = BoxEmbedVAE(self.embed_dim, self.hidden_dims)
-
-#         self.prior = HierarchicalPrior(
-#             boxes_per_level=self.boxes_per_level, embed_dim=self.embed_dim, temp=self.gumbel_temp
-#         )
-
-#         self.loss_weights = config["model"]["config"]["loss_weights"]
-#         self.min_side_length = config["model"]["config"]["min_side_length"]
-
-#         if self.loss_weights.get("ssim", 0) > 0:
-#             self.ssim_fn = SSIM(data_range=1.0, size_average=True, channel=3)
-
-#     def divide_into_patches(self, images):
-#         B, C, H, W = images.shape
-#         gh, gw = self.grid_size
-#         ph, pw = H // gh, W // gw
-        
-#         patches = images.view(B, C, gh, ph, gw, pw) # (B, C, grid_h, patch_h, grid_w, patch_w)
-#         patches = patches.permute(0, 2, 4, 1, 3, 5).contiguous() # (B, grid_h, grid_w, C, patch_h, patch_w)
-        
-#         return patches.view(-1, C, ph, pw) # (B * Num_Patches, C, patch_h, patch_w)
-
-#     def forward(self, x):
-#         images = x["images"]
-#         B = images.shape[0]
-#         num_patches = self.grid_size[0] * self.grid_size[1]
-
-#         patches_flat = self.divide_into_patches(images)
-#         patches_resized = F.interpolate(patches_flat, size=self.image_size, mode='bilinear')
-
-#         all_inputs = torch.cat([images, patches_resized], dim=0)
-#         vae_out = self.vae(all_inputs)
-#         all_boxes = vae_out["box_embeddings"]
-
-#         priors, adj_matrices = self.prior()
-
-#         full_img_boxes = BoxTensor(all_boxes.min_embed[:B], all_boxes.max_embed[:B])
-#         patch_boxes = BoxTensor(all_boxes.min_embed[B:], all_boxes.max_embed[B:])
-
-#         return {
-#             "vae_out": vae_out,
-#             "full_img_boxes": full_img_boxes,
-#             "patch_boxes": patch_boxes,
-#             "prior_boxes": priors,
-#             "adj_matrices": adj_matrices,
-#             "inputs": all_inputs
-#         }
-
-#     def compute_inclusion_loss(self, encoded_boxes: BoxTensor, prior_boxes: BoxTensor):
-#         enc_min = encoded_boxes.min_embed.unsqueeze(1)
-#         enc_max = encoded_boxes.max_embed.unsqueeze(1)
-#         b_enc = BoxTensor(enc_min, enc_max)
-        
-#         # prior: (Num_Priors, D) -> (1, Num_Priors, D)
-#         pri_min = prior_boxes.min_embed.unsqueeze(0)
-#         pri_max = prior_boxes.max_embed.unsqueeze(0)
-#         b_pri = BoxTensor(pri_min, pri_max)
-        
-#         # Intersection: (Batch, Num_Priors, D)
-#         # Use prior temp
-#         temp = self.prior.intersection_temp
-#         inter = gumbel_intersection(b_enc, b_pri, temp)
-        
-#         # Volume: (Batch, Num_Priors)
-#         # Using soft volume
-#         vol = soft_volume(inter, temp) # Log volume
-        
-#         # Softmax over priors to get P(z | prior_k)
-#         # We use the volume as the logit. Larger intersection = higher prob.
-#         probs = F.softmax(vol, dim=1) # (Batch, Num_Priors)
-        
-#         # Uniformity Regularization (KL Divergence with Uniform)
-#         # We want the batch to use all priors roughly equally
-#         avg_probs = probs.mean(dim=0) # (Num_Priors)
-#         target_uniform = torch.ones_like(avg_probs) / avg_probs.shape[0]
-#         kl_uniform = F.kl_div(avg_probs.log(), target_uniform, reduction='sum')
-        
-#         # Inclusion Loss: Maximize expected intersection volume
-#         # We want to maximize sum(prob * volume). Since vol is log_vol, this is reasonable.
-#         # Minimizing negative weighted sum.
-#         inclusion = -(probs * vol).sum(dim=1).mean()
-        
-#         return inclusion, kl_uniform
-
-#     def training_step(self, batch, batch_idx):
-#         outputs = self(batch)
-        
-#         recons = outputs["vae_out"]["reconstruction"]
-#         inputs = outputs["inputs"]
-#         full_img_boxes = outputs["full_img_boxes"]
-#         patch_boxes = outputs["patch_boxes"]
-        
-#         prior_img = outputs["prior_boxes"][0]
-#         prior_patch = outputs["prior_boxes"][1]
-        
-#         recon_loss = F.mse_loss(recons, inputs)
-        
-#         if self.loss_weights.get("lpips", 0) > 0:
-#             recon_loss += self.lpips_fn(2*recons-1, 2*inputs-1).mean() * self.loss_weights["lpips"]
-            
-#         if self.loss_weights.get("ssim", 0) > 0:
-#             recon_loss += (1 - self.ssim_fn(recons, inputs)) * self.loss_weights["ssim"]
-
-#         incl_img, kl_img = self.compute_inclusion_loss(full_img_boxes, prior_img)
-#         incl_patch, kl_patch = self.compute_inclusion_loss(patch_boxes, prior_patch)
-        
-#         inclusion_total = (incl_img + incl_patch)
-#         kl_uniform_total = (kl_img + kl_patch)
-
-#         # --- 3. Regularization ---
-#         # Penalize huge boxes (standard box embedding reg)
-#         # We penalize both the encoded boxes and the learnable priors
-#         # all_boxes_list = [full_img_boxes, patch_boxes, prior_img, prior_patch]
-#         # vol_reg = 0
-#         # for b in all_boxes_list:
-#         #     vol_reg += soft_volume(b, 1.0).mean() # Simple log volume mean
-
-#         # Min side length (Prevent collapse)
-#         # side_reg = 0
-#         # for b in all_boxes_list:
-#         #      sides = b.side_lengths()
-#         #      # Penalize if side < min_len
-#         #      side_reg += F.relu(self.min_side_length - sides).sum(dim=-1).mean()
-
-#         # --- Total Loss ---
-#         total_loss = (
-#             recon_loss * self.loss_weights["reconstruction"] +
-#             inclusion_total * self.loss_weights["inclusion"] +
-#             kl_uniform_total * self.loss_weights["kl_uniform"]
-#             # vol_reg * self.loss_weights["volume_reg"] + 
-#             # side_reg # Usually weighted heavily or hard constraint
-#         )
-
-#         # --- Logging ---
-#         self.log_dict({
-#             "train/total_loss": total_loss,
-#             "train/recon_loss": recon_loss,
-#             "train/inclusion_loss": inclusion_total,
-#             "train/kl_uniform": kl_uniform_total,
-#             # "train/vol_reg": vol_reg,
-#         }, prog_bar=True)
-        
-#         # Visualization Hook
-#         if batch_idx == 0 and self.current_epoch % 5 == 0:
-#              self.viz_datapoint = {
-#                  "inputs": inputs[:4].detach().cpu(),
-#                  "recons": recons[:4].detach().cpu()
-#              }
-
-#         return total_loss
-
-#     def configure_optimizers(self):
-
-#         if self.config["trainer"]["optimizer"]["type"] == "Adam":
-#             return torch.optim.Adam(
-#                 self.parameters(),
-#                 **self.config["trainer"]["optimizer"]["config"],
-#             )
-#         else:
-#             raise ValueError(
-#                 f"Optimizer type {self.config['trainer']['optimizer']['type']} not implemented."
-#             )
-
-    
+    def on_after_backward(self):
+        if self.trainer.global_step % 100 == 0:  # Don't spam logs
+            for i, param in enumerate(self.prior.adjacency_logits):
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    print(f"Step {self.trainer.global_step}: Adjacency Level {i} Grad Norm: {grad_norm}")
+                    print(self.prior.adjacency_logits[0].sigmoid().mean())
+                    
+                else:
+                    print(f"Step {self.trainer.global_step}: Adjacency Level {i} Grad is None!")

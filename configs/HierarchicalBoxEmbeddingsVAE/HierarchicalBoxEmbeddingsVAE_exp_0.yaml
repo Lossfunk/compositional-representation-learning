@@ -1,0 +1,42 @@
+model:
+  type: "HierarchicalBoxEmbeddingsVAE"
+  config:
+    embed_dim: 3
+    hidden_dims: [32, 64, 128, 256]
+    grid_size: [4, 4]
+    input_resolution: [64, 64]
+    prior_config:
+      boxes_per_level: [32, 8]
+    loss_weights:
+      patch_pull_loss: 1.0
+      full_image_pull_loss: 2.0
+      inclusion_loss: 10.0
+      patch_mse_loss: 10.0
+      patch_ssim_loss: 2.0
+      full_image_mse_loss: 50.0
+      full_image_ssim_loss: 10.0
+      loss_uniform_patch: 0.0
+      loss_uniform_full: 0.0
+      loss_disjoint_full: 1.0
+
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size: [64, 64]
+      shapes: ["circle", "square"]
+      colors: ["red"]
+      num_samples: 1000
+      return_metadata: True
+      center_range: [16, 48]
+      size_range: [10, 30]
+    dataloader_config:
+      batch_size: 32
+      shuffle: True
+
+trainer:
+  max_epochs: 200
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

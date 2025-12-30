@@ -61,7 +61,7 @@ if __name__ == "__main__":
     wandb_logger = WandbLogger(project="compositional-representation-learning", name=experiment_id)
     wandb_logger.experiment.config.update(config)
     experiment = wandb_logger.experiment
-    experiment.watch(pl_module, log='all', log_freq=10) 
+    # experiment.watch(pl_module, log='all', log_freq=10) 
 
     model_checkpoint = ModelCheckpoint(
         dirpath=model_checkpoint_dir,
