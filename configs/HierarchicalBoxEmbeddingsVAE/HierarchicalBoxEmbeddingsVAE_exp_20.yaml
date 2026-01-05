@@ -1,36 +1,48 @@
 model:
-  type: "HierarchicalBoxEmbeddingsVAE"
+  type: "HierarchicalBoxVAE"
   config:
     embed_dim: 8
-    hidden_dims: [32, 64, 128, 256]
     grid_size: [4, 4]
     input_resolution: [64, 64]
-    beta_scale: 0.4
     crop_padding_range: [4,8]
-    pull_method: intersection
+    pull_method: distance
+    beta_scale: 0.4
+    beta_pre_init: -2.0
+    beta_activation: sigmoid
+    vae_config:
+      hidden_dims: [32, 64, 128, 256]
     prior_config:
       boxes_per_level: [32, 4]
+      gumbel_temp: 0.5
+      gumbel_hard: False
       init_config:
+        center_variance: 1.0
+        width_variance: 0.3
+        min_width: 0.3
         sparse_init: True
-        num_init_connections: 16
-        logit_value: 3.0
+        num_init_connections: 6
+        logit_value: 0.4
+    hebbian_start_epoch: 50
+    full_image_start_epoch: 15
     loss_weights:
       patch_pull_loss: 1.0
-      full_image_pull_loss: 1.0
+      full_image_pull_loss: 0.0
       inclusion_loss: 0.0
       exclusion_loss: 0.0
       patch_mse_loss: 10.0
       patch_ssim_loss: 2.0
-      full_image_mse_loss: 10.0
-      full_image_ssim_loss: 2.0
+      full_image_mse_loss: 0.0
+      full_image_ssim_loss: 0.0
       loss_uniform_patch: 0.0
       loss_uniform_full: 0.0
       loss_disjoint_full: 0.0
+      loss_disjoint_patch: 10.0
       entropy_loss: 0.0
-      hebbian_loss: 1.0
+      hebbian_loss: 0.0
       l0_entropy_loss: 0.0
       l1_entropy_loss: 0.0
       l0_vol_penalty: 0.0
+      l1_vol_penalty: 0.0
 
 data:
   train:
@@ -48,8 +60,9 @@ data:
       shuffle: True
 
 trainer:
-  max_epochs: 200
+  max_epochs: 100
   optimizer:
     type: Adam
     config:
-      lr: 0.0001
+      vae_lr: 0.0001
+      prior_lr: 0.001

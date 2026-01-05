@@ -185,15 +185,16 @@ def gumbel_sigmoid(logits, temperature=1.0, hard=False, eps=1e-10):
 
 
 class HierarchicalBoxEmbeddingsPrior(nn.Module):
-    def __init__(self, boxes_per_level: list[int], embed_dim: int, beta_scale, init_config):
+    def __init__(self, prior_config: dict, embed_dim: int, beta_scale=0.4):
         super().__init__()
-        self.boxes_per_level = boxes_per_level
+        self.prior_config = prior_config
+        self.init_config = prior_config["init_config"]
+        self.boxes_per_level = prior_config["boxes_per_level"]
         self.embed_dim = embed_dim
         self.beta_scale = beta_scale
-        self.init_config = init_config
-        self.num_levels = len(boxes_per_level)
+        self.num_levels = len(self.boxes_per_level)
 
-        num_root_boxes = boxes_per_level[0]
+        num_root_boxes = self.boxes_per_level[0]
 
         # self.root_mu_min = nn.Parameter(torch.rand(1, num_root_boxes, embed_dim) * 0.1)
         # self.root_mu_max = nn.Parameter(torch.rand(1, num_root_boxes, embed_dim) * 0.1 + 0.9)
@@ -215,11 +216,11 @@ class HierarchicalBoxEmbeddingsPrior(nn.Module):
             num_parents = self.boxes_per_level[level_idx]
             num_children = self.boxes_per_level[level_idx + 1]
 
-            if init_config.get("sparse_init", False):
+            if self.init_config.get("sparse_init", False):
 
-                logit_init_value = init_config.get("logit_value", 1.0)
+                logit_init_value = self.init_config.get("logit_value", 1.0)
                 logits = torch.ones(num_children, num_parents) * -logit_init_value
-                num_init_connections = init_config.get("init_config", num_parents // num_children)
+                num_init_connections = self.init_config.get("num_init_connections", num_parents // num_children)
 
                 for child_idx in range(num_children):
                     parent_indices = torch.randperm(num_parents)[:num_init_connections]
@@ -250,9 +251,13 @@ class HierarchicalBoxEmbeddingsPrior(nn.Module):
         root_box_dists = self.get_root_boxes()
         all_level_box_dists = [root_box_dists]
         curr_box_dists = root_box_dists
+
+        gumbel_temp = self.prior_config.get("gumbel_temp", 0.5)
+        gumbel_hard = self.prior_config.get("gumbel_hard", False)
+
         for level_idx in range(self.num_levels - 1):
             level_adjacency_logits = self.adjacency_logits[level_idx].unsqueeze(0)
-            level_adjacency_weights = gumbel_sigmoid(level_adjacency_logits, temperature=0.5, hard=True)
+            level_adjacency_weights = gumbel_sigmoid(level_adjacency_logits, temperature=gumbel_temp, hard=gumbel_hard)
             level_box_dists = soft_box_weighted_intersection(curr_box_dists, level_adjacency_weights)
             
             all_level_box_dists.append(level_box_dists)

@@ -7,17 +7,20 @@ model:
     input_resolution: [64, 64]
     beta_scale: 0.4
     crop_padding_range: [4,8]
-    pull_method: intersection
+    pull_method: distance
+    hebbian_start_epoch: 50
     prior_config:
       boxes_per_level: [32, 4]
+      gumbel_temp: 0.5
+      gumbel_hard: False
       init_config:
         sparse_init: True
-        num_init_connections: 16
-        logit_value: 3.0
+        num_init_connections: 10
+        logit_value: 0.2
     loss_weights:
       patch_pull_loss: 1.0
       full_image_pull_loss: 1.0
-      inclusion_loss: 0.0
+      inclusion_loss: 1.0
       exclusion_loss: 0.0
       patch_mse_loss: 10.0
       patch_ssim_loss: 2.0
@@ -52,4 +55,5 @@ trainer:
   optimizer:
     type: Adam
     config:
-      lr: 0.0001
+      vae_lr: 0.0001
+      prior_lr: 0.01

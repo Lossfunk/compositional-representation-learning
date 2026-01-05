@@ -7,7 +7,7 @@ model:
     input_resolution: [64, 64]
     beta_scale: 0.4
     crop_padding_range: [4,8]
-    pull_method: intersection
+    pull_method: distance
     prior_config:
       boxes_per_level: [32, 4]
       init_config:

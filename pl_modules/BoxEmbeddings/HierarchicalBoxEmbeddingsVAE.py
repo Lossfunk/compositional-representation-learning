@@ -32,10 +32,13 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         )
 
         self.prior = HierarchicalBoxEmbeddingsPrior(
-            boxes_per_level=self.model_config["prior_config"]["boxes_per_level"],
+            prior_config=self.model_config["prior_config"],
             embed_dim=self.embed_dim,
-            beta_scale = self.beta_scale,
-            init_config=self.model_config["prior_config"]["init_config"]
+            beta_scale=self.beta_scale,
+            # boxes_per_level=self.model_config["prior_config"]["boxes_per_level"],
+            # embed_dim=self.embed_dim,
+            # beta_scale = self.beta_scale,
+            # init_config=self.model_config["prior_config"]["init_config"]
         )
 
         self.loss_weights = self.model_config["loss_weights"]
@@ -155,19 +158,87 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         # ----- Pull Loss Computation -----
         patch_cluster_intersections = self.compute_cluster_intersections(patch_box_dists, patch_prior_box_dists) # Internal parameter shape: (B*N, N_P, D)
         patch_cluster_intersections_volume = bessel_volume(patch_cluster_intersections, volume_temp=0.1, log_scale=True) # (B*N, N_P)
-        encoded_patch_volume = bessel_volume(patch_box_dists, volume_temp=0.1, log_scale=True).unsqueeze(1) # (B*N, 1)
         patch_cluster_assignment_logits = patch_cluster_intersections_volume
         patch_cluster_assignment_probs = F.softmax(patch_cluster_assignment_logits, dim = -1)
-        patch_cluster_volume_diff = F.relu(encoded_patch_volume - patch_cluster_intersections_volume)
-        patch_cluster_pull_loss = torch.sum(patch_cluster_assignment_probs.detach() * patch_cluster_volume_diff, dim=1).mean()
+        encoded_patch_volume = bessel_volume(patch_box_dists, volume_temp=0.1, log_scale=True).unsqueeze(1) # (B*N, 1)
+        
+        if self.model_config["pull_method"] == "intersection":
+            
+            patch_cluster_volume_diff = F.relu(encoded_patch_volume - patch_cluster_intersections_volume)
+            
+            patch_cluster_pull_loss = torch.sum(patch_cluster_assignment_probs.detach() * patch_cluster_volume_diff, dim=1).mean()
+       
+        elif self.model_config["pull_method"] == "distance":
+            enc_mu_min = patch_box_dists.mu_min.unsqueeze(1)
+            enc_mu_max = patch_box_dists.mu_max.unsqueeze(1)
+            prior_mu_min = patch_prior_box_dists.mu_min
+            prior_mu_max = patch_prior_box_dists.mu_max
+            
+            # This pulls the 'min' corners together and 'max' corners together.
+            min_dist = torch.sum((enc_mu_min - prior_mu_min)**2, dim=-1) # (B*N, N_P)
+            max_dist = torch.sum((enc_mu_max - prior_mu_max)**2, dim=-1) # (B*N, N_P)
+            
+            enc_beta_min = patch_box_dists.beta_min.unsqueeze(1)
+            enc_beta_max = patch_box_dists.beta_max.unsqueeze(1)
+            prior_beta_min = patch_prior_box_dists.beta_min
+            prior_beta_max = patch_prior_box_dists.beta_max
 
-        full_image_cluster_intersections = self.compute_cluster_intersections(full_image_box_dists, full_image_prior_box_dists) # Internal parameter shape: (B, N_FI, D)
-        full_image_cluster_intersections_volume = bessel_volume(full_image_cluster_intersections, volume_temp=0.1, log_scale=True) # (B, N_FI)
-        encoded_full_image_volume = bessel_volume(full_image_box_dists, volume_temp=0.1, log_scale=True).unsqueeze(1) # (B, 1)
+            beta_min_dist = torch.sum((enc_beta_min - prior_beta_min)**2, dim=-1)
+            beta_max_dist = torch.sum((enc_beta_max - prior_beta_max)**2, dim=-1)
+            
+            total_geometric_dist = min_dist + max_dist# + 0.5 * (beta_min_dist + beta_max_dist)
+            
+            patch_cluster_pull_loss = torch.sum(patch_cluster_assignment_probs.detach() * total_geometric_dist, dim=1).mean()
+
+        elif self.model_config["pull_method"] == "centroid":
+            enc_mu_min = patch_box_dists.mu_min.unsqueeze(1)
+            enc_mu_max = patch_box_dists.mu_max.unsqueeze(1)
+            prior_mu_min = patch_prior_box_dists.mu_min
+            prior_mu_max = patch_prior_box_dists.mu_max
+
+            
+
+
+        full_image_cluster_intersections = self.compute_cluster_intersections(full_image_box_dists, full_image_prior_box_dists)
+        full_image_cluster_intersections_volume = bessel_volume(full_image_cluster_intersections, volume_temp=0.1, log_scale=True)
         full_image_cluster_assignment_logits = full_image_cluster_intersections_volume
-        full_image_cluster_assignment_probs = F.softmax(full_image_cluster_assignment_logits, dim = -1)
-        full_image_volume_diff = F.relu(encoded_full_image_volume - full_image_cluster_intersections_volume)
-        full_image_cluster_pull_loss = torch.sum(full_image_cluster_assignment_probs.detach() * full_image_volume_diff, dim=1).mean()
+        full_image_cluster_assignment_probs = F.softmax(full_image_cluster_assignment_logits, dim=-1)
+        encoded_full_image_volume = bessel_volume(full_image_box_dists, volume_temp=0.1, log_scale=True).unsqueeze(1)
+
+        if self.model_config["pull_method"] == "intersection":
+            
+            full_image_volume_diff = F.relu(encoded_full_image_volume - full_image_cluster_intersections_volume)
+            full_image_cluster_pull_loss = torch.sum(full_image_cluster_assignment_probs.detach() * full_image_volume_diff, dim=1).mean()
+
+        elif self.model_config["pull_method"] == "distance":
+            enc_mu_min = full_image_box_dists.mu_min.unsqueeze(1)
+            enc_mu_max = full_image_box_dists.mu_max.unsqueeze(1)
+            prior_mu_min = full_image_prior_box_dists.mu_min
+            prior_mu_max = full_image_prior_box_dists.mu_max
+
+            min_dist = torch.sum((enc_mu_min - prior_mu_min)**2, dim=-1) # (B, N_FI)
+            max_dist = torch.sum((enc_mu_max - prior_mu_max)**2, dim=-1) # (B, N_FI)
+
+            enc_beta_min = full_image_box_dists.beta_min.unsqueeze(1)
+            enc_beta_max = full_image_box_dists.beta_max.unsqueeze(1)
+            prior_beta_min = full_image_prior_box_dists.beta_min
+            prior_beta_max = full_image_prior_box_dists.beta_max
+
+            beta_min_dist = torch.sum((enc_beta_min - prior_beta_min)**2, dim=-1)
+            beta_max_dist = torch.sum((enc_beta_max - prior_beta_max)**2, dim=-1)
+            
+            total_geometric_dist = min_dist + max_dist# + 0.5 * (beta_min_dist + beta_max_dist)
+            
+            full_image_cluster_pull_loss = torch.sum(full_image_cluster_assignment_probs.detach() * total_geometric_dist, dim=1).mean()
+        
+
+        # full_image_cluster_intersections = self.compute_cluster_intersections(full_image_box_dists, full_image_prior_box_dists) # Internal parameter shape: (B, N_FI, D)
+        # full_image_cluster_intersections_volume = bessel_volume(full_image_cluster_intersections, volume_temp=0.1, log_scale=True) # (B, N_FI)
+        # encoded_full_image_volume = bessel_volume(full_image_box_dists, volume_temp=0.1, log_scale=True).unsqueeze(1) # (B, 1)
+        # full_image_cluster_assignment_logits = full_image_cluster_intersections_volume
+        # full_image_cluster_assignment_probs = F.softmax(full_image_cluster_assignment_logits, dim = -1)
+        # full_image_volume_diff = F.relu(encoded_full_image_volume - full_image_cluster_intersections_volume)
+        # full_image_cluster_pull_loss = torch.sum(full_image_cluster_assignment_probs.detach() * full_image_volume_diff, dim=1).mean()
 
 
         # ----- Inclusion Loss Computation -----
@@ -241,8 +312,7 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         all_pairs_vol = torch.exp(all_pairs_log_vol)
         adj_logits = self.prior.adjacency_logits[0] # Shape: (Num_L1, Num_L0)
         adj_weights = torch.sigmoid(adj_logits)
-        exclusion_loss = ((1.0 - adj_weights.detach().unsqueeze(0)) * all_pairs_vol).mean()
-
+        exclusion_loss = ((1.0 - adj_weights.detach()) * all_pairs_vol).mean()
 
         # ----- Reconstruction Loss -----
         recon_loss_full_mse = F.mse_loss(full_image_reconstruction, images)
@@ -297,8 +367,6 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         else:
             hebbian_loss = 0.0
 
-        hebbian_weight = 100.0 * min(1.0, self.current_epoch / 50.0)
-
 
         # ----- Regularization Losses -----
         
@@ -308,6 +376,7 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
 
         # --- Disjoint Prior Loss ---
         loss_disjoint_full = self.compute_pairwise_disjoint_loss(prior_box_dists[1])
+        loss_disjoint_patch = self.compute_pairwise_disjoint_loss(prior_box_dists[0])
 
         # --- Entropy Loss ---
         adj_logits = self.prior.adjacency_logits[0]
@@ -326,27 +395,49 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         l1_entropy = -torch.sum(avg_l1_usage * torch.log(avg_l1_usage + 1e-10))
         l1_entropy_loss = -l1_entropy
 
-        # --- l0 box volume penalty ---
+        # --- Box Volume Penalty ---
         l0_vol = bessel_volume(flat_l0_dist, log_scale=False)
-        l0_vol_penalty = l0_vol.mean() * 10.0
+        l0_vol_penalty = l0_vol.mean()
+
+        l1_vol = bessel_volume(flat_l1_dist, log_scale=False)
+        l1_vol_penalty = l1_vol.mean()
+
+        if "hebbian_start_epoch" in self.model_config:
+            if self.current_epoch >= self.model_config["hebbian_start_epoch"]:
+                enable_hebbian = 1.0
+            else:
+                enable_hebbian = 0.0
+        else:
+            enable_hebbian = 1.0
+
+        if "full_image_start_epoch" in self.model_config:
+            if self.current_epoch >= self.model_config["full_image_start_epoch"]:
+                enable_full_image = 1.0
+            else:
+                enable_full_image = 0.0
+        else:
+            enable_full_image = 1.0
+
 
         total_loss = (
             self.loss_weights["patch_mse_loss"] * recon_loss_patch_mse +
             self.loss_weights["patch_ssim_loss"] * recon_loss_patch_ssim +
-            self.loss_weights["full_image_mse_loss"] * recon_loss_full_mse +
-            self.loss_weights["full_image_ssim_loss"] * recon_loss_full_ssim +
+            self.loss_weights["full_image_mse_loss"] * recon_loss_full_mse * enable_full_image +
+            self.loss_weights["full_image_ssim_loss"] * recon_loss_full_ssim * enable_full_image +
             self.loss_weights["patch_pull_loss"] * patch_cluster_pull_loss +
-            self.loss_weights["full_image_pull_loss"] * full_image_cluster_pull_loss +
-            self.loss_weights["inclusion_loss"] * inclusion_loss +
-            self.loss_weights["exclusion_loss"] * exclusion_loss +
+            self.loss_weights["full_image_pull_loss"] * full_image_cluster_pull_loss * enable_full_image +
+            self.loss_weights["inclusion_loss"] * inclusion_loss * enable_full_image +
+            self.loss_weights["exclusion_loss"] * exclusion_loss * enable_full_image +
             self.loss_weights["loss_uniform_patch"] * loss_uniform_patch + 
-            self.loss_weights["loss_uniform_full"] * loss_uniform_full + 
+            self.loss_weights["loss_uniform_full"] * loss_uniform_full * enable_full_image + 
             self.loss_weights["loss_disjoint_full"] * loss_disjoint_full +
+            self.loss_weights["loss_disjoint_patch"] * loss_disjoint_patch + 
             self.loss_weights["entropy_loss"] * entropy_loss +
-            self.loss_weights["hebbian_loss"] * hebbian_loss +
+            self.loss_weights["hebbian_loss"] * hebbian_loss * enable_hebbian +
             self.loss_weights["l0_entropy_loss"] * l0_entropy_loss +
             self.loss_weights["l1_entropy_loss"] * l1_entropy_loss +
-            self.loss_weights["l0_vol_penalty"] * l0_vol_penalty
+            self.loss_weights["l0_vol_penalty"] * l0_vol_penalty + 
+            self.loss_weights["l1_vol_penalty"] * l1_vol_penalty
         )
 
         loss_dict = {
@@ -361,12 +452,14 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
             "full_image_ssim_loss": recon_loss_full_ssim,
             "loss_uniform_patch": loss_uniform_patch,
             "loss_uniform_full": loss_uniform_full,
+            "loss_disjoint_patch": loss_disjoint_patch,
             "loss_disjoint_full": loss_disjoint_full,
             "entropy_loss": entropy_loss,
             "hebbian_loss": hebbian_loss,
             "l0_entropy_loss": l0_entropy_loss,
             "l1_entropy_loss": l1_entropy_loss,
-            "l0_vol_penalty": l0_vol_penalty
+            "l0_vol_penalty": l0_vol_penalty,
+            "l1_vol_penalty": l1_vol_penalty
         }
         self.log_dict(loss_dict, prog_bar=True, on_epoch=True)
 
@@ -381,6 +474,7 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
             }
 
         return total_loss
+
 
     def compute_cluster_intersections(self, encoded_box_dists, prior_box_dists):
         # Encoded box dists have internal parameter shape (B, D)
@@ -455,8 +549,26 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
         # 4. Loss = Sum of all off-diagonal volumes
         # We want this to be 0 (Disjoint)
         disjoint_loss = volumes_masked.sum() / (n_clusters * (n_clusters - 1))
+
+        centers = (flat_mu_min + flat_mu_max) / 2.0
+
+        r = torch.sum(centers**2, dim=1).view(-1, 1)
+        dist_sq = r - 2.0 * torch.matmul(centers, centers.t()) + r.t()
+        dist_sq = F.relu(dist_sq) # Clamp negative noise
+        dist = torch.sqrt(dist_sq + 1e-8)
+
+        # 3. Hinge Loss: Penalize if distance < Threshold
+        # We want every pair to be at least 'margin' apart
+        margin = 0.5
         
-        return disjoint_loss
+        # Mask diagonal (dist to self is 0, which is fine)
+        n = centers.shape[0]
+        mask_ = 1.0 - torch.eye(n, device=centers.device)
+        
+        # Loss = sum(ReLU(margin - dist)) for all off-diagonal pairs
+        repulsion_loss = (mask_ * F.relu(margin - dist)).sum() / (n * (n-1))
+        
+        return disjoint_loss + repulsion_loss
 
     def divide_image_into_patches(self, images):
         B, C, H, W = images.shape
@@ -478,10 +590,15 @@ class HierarchicalBoxEmbeddingsVAE(L.LightningModule):
     def configure_optimizers(self):
 
         if self.config["trainer"]["optimizer"]["type"] == "Adam":
-            return torch.optim.Adam(
-                self.parameters(),
-                **self.config["trainer"]["optimizer"]["config"],
-            )
+            # return torch.optim.Adam(
+            #     self.parameters(),
+            #     **self.config["trainer"]["optimizer"]["config"],
+            # )
+            optimizer = torch.optim.Adam([
+                {'params': self.vae.parameters(), 'lr': self.config["trainer"]["optimizer"]["config"]["vae_lr"]},
+                {'params': self.prior.parameters(), 'lr': self.config["trainer"]["optimizer"]["config"]["prior_lr"]}
+            ])
+            return optimizer
         else:
             raise ValueError(
                 f"Optimizer type {self.config['trainer']['optimizer']['type']} not implemented."
