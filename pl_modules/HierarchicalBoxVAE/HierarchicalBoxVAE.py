@@ -2,7 +2,7 @@ import random
 
 import torch
 import torchvision
-from torch import nn
+from torch import log_, nn
 from torch.nn import functional as F
 import lightning as L
 import numpy as np
@@ -26,7 +26,7 @@ class HierarchicalBoxVAE(L.LightningModule):
         self.grid_size = self.model_config["grid_size"]
         self.input_resolution = self.model_config["input_resolution"]
         self.crop_padding_range = self.model_config["crop_padding_range"]
-        self.pull_method = self.model_config["pull_method"]
+        # self.pull_method = self.model_config["pull_method"]
 
         self.beta_scale = self.model_config["beta_scale"]
         self.beta_pre_init = self.model_config["beta_pre_init"]
@@ -38,7 +38,6 @@ class HierarchicalBoxVAE(L.LightningModule):
             input_resolution=self.input_resolution,
             beta_scale = self.beta_scale,
             beta_pre_init = self.beta_pre_init,
-            beta_scale = self.beta_scale
         )
 
         self.prior = HierarchicalBoxPrior(
@@ -143,12 +142,12 @@ class HierarchicalBoxVAE(L.LightningModule):
 
         # ----- LOSS COMPUTATIONS ----
         # --- Pull Loss ---
-        patch_pull_loss = self.compute_pull_loss(
+        patch_pull_loss, patch_prior_assignment_probs = self.compute_pull_loss(
             computed_box_dists = patch_box_dists,
             computed_box_samples = patch_samples,
             prior_box_dists = patch_prior_box_dists_flat
         )
-        full_image_pull_loss = self.compute_pull_loss(
+        full_image_pull_loss, full_image_prior_assignment_probs = self.compute_pull_loss(
             computed_box_dists = full_image_box_dists,
             computed_box_samples = full_image_samples,
             prior_box_dists = full_image_prior_box_dists_flat
@@ -158,13 +157,62 @@ class HierarchicalBoxVAE(L.LightningModule):
         recon_loss_full_mse, recon_loss_full_ssim = self.compute_reconstruction_loss(images, full_image_reconstructions)
         recon_loss_patch_mse, recon_loss_patch_ssim = self.compute_reconstruction_loss(patches, patch_reconstructions)
 
+        # --- Entropy Loss ---
+        avg_l0_usage = patch_prior_assignment_probs.mean(dim = 0)
+        l0_entropy = -torch.sum(avg_l0_usage * torch.log(avg_l0_usage + 1e-10))
+        l0_entropy_loss = -l0_entropy
+
+        avg_l1_usage = full_image_prior_assignment_probs.mean(dim = 0)
+        l1_entropy = -torch.sum(avg_l1_usage * torch.log(avg_l1_usage + 1e-10))
+        l1_entropy_loss = -l1_entropy
+
+        # --- Box Volume Penalty ---
+        l0_vol = bessel_volume(patch_prior_box_dists_flat, log_scale=False)
+        l0_vol_penalty = l0_vol.mean()
+
+        l1_vol = bessel_volume(full_image_prior_box_dists_flat, log_scale=False)
+        l1_vol_penalty = l1_vol.mean()
+
+        # --- Disjoint Loss ---
+        l0_disjoint_loss = self.compute_disjoint_loss(patch_prior_box_dists_flat)
+        l1_disjoint_loss = self.compute_disjoint_loss(full_image_prior_box_dists_flat)
+
+        patch_disjoint_loss = self.compute_disjoint_loss(patch_box_dists)
+        full_image_disjoint_loss = self.compute_disjoint_loss(full_image_box_dists)
+
+
+        # ----- LOSS AGGREGATION ----
+
+        if "pull_loss_start_epoch" in self.model_config:
+            if self.current_epoch >= self.model_config["pull_loss_start_epoch"]:
+                enable_pull_loss = 1.0
+                if "pull_loss_warmup_epochs" in self.model_config:
+                    pull_loss_warmup_factor = min(1.0, (self.current_epoch - self.model_config["pull_loss_start_epoch"])/self.model_config["pull_loss_warmup_epochs"])
+                else:
+                    pull_loss_warmup_factor = 1.0
+            else:
+                enable_pull_loss = 0.0
+                pull_loss_warmup_factor = 1.0
+        else:
+            enable_pull_loss = 1.0
+            pull_loss_warmup_factor = 1.0
+
+
         total_loss = (
             self.loss_weights["patch_mse_loss"] * recon_loss_patch_mse +
             self.loss_weights["patch_ssim_loss"] * recon_loss_patch_ssim +
             self.loss_weights["full_image_mse_loss"] * recon_loss_full_mse +
             self.loss_weights["full_image_ssim_loss"] * recon_loss_full_ssim +
-            self.loss_weights["patch_pull_loss"] * patch_pull_loss +
-            self.loss_weights["full_image_pull_loss"] * full_image_pull_loss
+            self.loss_weights["patch_pull_loss"] * patch_pull_loss * enable_pull_loss * pull_loss_warmup_factor +
+            self.loss_weights["full_image_pull_loss"] * full_image_pull_loss * enable_pull_loss * pull_loss_warmup_factor + 
+            self.loss_weights["l0_entropy_loss"] * l0_entropy_loss + 
+            self.loss_weights["l1_entropy_loss"] * l1_entropy_loss + 
+            self.loss_weights["l0_vol_penalty"] * l0_vol_penalty +
+            self.loss_weights["l1_vol_penalty"] * l1_vol_penalty + 
+            self.loss_weights["l0_disjoint_loss"] * l0_disjoint_loss +
+            self.loss_weights["l1_disjoint_loss"] * l1_disjoint_loss + 
+            self.loss_weights["patch_disjoint_loss"] * patch_disjoint_loss + 
+            self.loss_weights["full_image_disjoint_loss"] * full_image_disjoint_loss
         )
 
         loss_dict = {
@@ -174,7 +222,16 @@ class HierarchicalBoxVAE(L.LightningModule):
             "full_image_mse_loss": recon_loss_full_mse,
             "full_image_ssim_loss": recon_loss_full_ssim,
             "patch_pull_loss": patch_pull_loss,
-            "full_image_pull_loss": full_image_pull_loss
+            "full_image_pull_loss": full_image_pull_loss,
+            "l0_entropy_loss": l0_entropy_loss,
+            "l1_entropy_loss": l1_entropy_loss,
+            "l0_vol_penalty": l0_vol_penalty,
+            "l1_vol_penalty": l1_vol_penalty,
+            "l0_disjoint_loss": l0_disjoint_loss,
+            "l1_disjoint_loss": l1_disjoint_loss,
+            "patch_disjoint_loss": patch_disjoint_loss,
+            "full_image_disjoint_loss": full_image_disjoint_loss
+
         }
         self.log_dict(loss_dict, prog_bar=True, on_epoch=True)
 
@@ -182,10 +239,32 @@ class HierarchicalBoxVAE(L.LightningModule):
             N = self.grid_size[0] * self.grid_size[1]
             self.viz_datapoint = {
                 "original_image": images[0].detach().cpu(),
-                "recon_image": output["full_image_reconstruction"][0].detach().cpu(),
+                "recon_image": output["full_image_reconstructions"][0].detach().cpu(),
                 "input_patches": patches[:N].detach().cpu(),
-                "recon_patches": output["patch_reconstruction"][:N].detach().cpu()
+                "recon_patches": output["patch_reconstructions"][:N].detach().cpu()
             }
+
+        usage_counts = patch_prior_assignment_probs.sum(dim=0) # Shape: (M,)
+        
+        # Log usage as a histogram or just the standard deviation of usage (0 = perfect balance)
+        usage_std = usage_counts.std()
+        self.log("metrics/prior_usage_std", usage_std)
+        
+        # Log the count of "Dead Boxes" (boxes used < 1% of the time)
+        threshold = patch_prior_assignment_probs.shape[0] * 0.01
+        dead_boxes = (usage_counts < threshold).sum().float()
+        self.log("metrics/dead_boxes", dead_boxes)
+
+        # 2. LOG SAMPLE DISPERSION (Is the Encoder collapsing?)
+        # patch_samples shape: (B*N, D*2)
+        # Calculate how spread out the samples are in the latent space
+        sample_spread = patch_samples.std(dim=0).mean()
+        self.log("metrics/sample_spread", sample_spread)
+        
+        # 3. LOG DISJOINT MAGNITUDE vs PULL MAGNITUDE (Diagnostic)
+        # This gives us a proxy for which loss is "winning"
+        self.log("debug/l0_disjoint_val", l0_disjoint_loss.detach(), on_step=True)
+        self.log("debug/patch_pull_val", patch_pull_loss.detach(), on_step=True)
 
         return total_loss
 
@@ -249,13 +328,20 @@ class HierarchicalBoxVAE(L.LightningModule):
         computed_box_samples have shape (N, D*2)
         prior_box_dists have internal parameter shape of (M, D)
         """
+        assignment_temp = self.model_config.get("pull_assignment_temperature", 1.0)
+        assignment_activation = self.model_config.get("pull_assignment_activation", "softmax")
+        assignment_hard = self.model_config.get("pull_assignment_hard", False) 
 
         intersection_box_dists = pairwise_gumbel_intersection(
             computed_box_dists,
             prior_box_dists
         ) # Internal parameter shape: (N, M, D)
         intersection_volume = bessel_volume(intersection_box_dists, volume_temp = 0.1, log_scale = True) # (N, M)
-        prior_assignment_probs = F.softmax(intersection_volume, dim = -1) # (N, M)
+        if assignment_activation == "softmax":
+            prior_assignment_probs = F.softmax(intersection_volume / assignment_temp, dim = -1).detach() # (N, M)
+        elif assignment_activation == "gumbel_softmax":
+            prior_assignment_probs = F.gumbel_softmax(intersection_volume, tau=assignment_temp, hard=assignment_hard, dim = -1) # (N, M)
+
 
         samples_min = computed_box_samples[..., :self.embed_dim].unsqueeze(1) # (N, 1, D)
         samples_max = computed_box_samples[..., self.embed_dim:].unsqueeze(1) # (N, 1, D)
@@ -267,19 +353,39 @@ class HierarchicalBoxVAE(L.LightningModule):
             prior_box_dists.beta_max.unsqueeze(0)
         ) # Internal parameter shape: (1, M, D)
 
-        log_probs = self.compute_box_log_prob(
-            samples_min,
-            samples_max,
-            prior_box_dists_expanded
-        ) # (N, M, D)
-        log_likelihoods = log_probs.sum(dim=-1) # (N, M)
+        if self.model_config["pull_loss_method"] == "box_likelihood":
+            log_probs = self.compute_box_log_prob(
+                samples_min,
+                samples_max,
+                prior_box_dists_expanded
+            ) # (N, M, D)
+            log_likelihoods = log_probs.sum(dim=-1) # (N, M)
+            per_sample_loss = -torch.sum(prior_assignment_probs * log_likelihoods, dim=1) # (N,)
 
-        per_sample_loss = -torch.sum(prior_assignment_probs * log_likelihoods, dim=1) # (N,)
+        elif self.model_config["pull_loss_method"] == "containment":
+            violation_min = F.relu(prior_box_dists_expanded.mu_min - samples_min) # (N, M, D)
+            violation_max = F.relu(samples_max - prior_box_dists_expanded.mu_max) # (N, M, D)
+            
+            geometric_distance = (violation_min + violation_max).sum(dim=-1) # (N, M)
+            per_sample_loss = torch.sum(prior_assignment_probs * geometric_distance, dim=1) # (N,)
+
+        elif self.model_config["pull_loss_method"] == "corner_distance":
+            min_corner_dist = torch.sum((prior_box_dists_expanded.mu_min - samples_min)**2, dim = -1) # (N, M)
+            max_corner_dist = torch.sum((prior_box_dists_expanded.mu_max - samples_max)**2, dim = -1) # (N, M)
+
+            total_corner_dist = min_corner_dist + max_corner_dist # (N, M)
+            per_sample_loss = torch.sum(total_corner_dist, dim = 1) # (N,)
+        
+        else:
+            raise ValueError(
+                f"Pull Loss method {self.model_config["pull_loss_method"]} not implemented."
+            )
+
         pull_loss = per_sample_loss.mean()
 
-        return pull_loss
+        return pull_loss, prior_assignment_probs
 
-    def compute_box_log_prob(sample_min: torch.Tensor, sample_max: torch.Tensor, box_dists: BoxDistribution, eps: float = 1e-10) -> torch.Tensor:
+    def compute_box_log_prob(self, sample_min: torch.Tensor, sample_max: torch.Tensor, box_dists: BoxDistribution, eps: float = 1e-10) -> torch.Tensor:
         """
         Computes the log-probability of a sampled box under a BoxDistribution.
         
@@ -291,7 +397,7 @@ class HierarchicalBoxVAE(L.LightningModule):
         Returns:
             total_log_prob: Shape (N, M, D) - The log prob per dimension
         """
-        
+
         # --- Min Coordinate (Standard Gumbel) ---
         # Log PDF: -log(beta) - z - exp(-z), where z = (x - mu) / beta
         z_min = (sample_min - box_dists.mu_min) / (box_dists.beta_min + eps)
@@ -313,6 +419,46 @@ class HierarchicalBoxVAE(L.LightningModule):
         recon_ssim_loss = 1 - self.ssim_loss_fn(reconstructed_images, original_images)
 
         return recon_mse_loss, recon_ssim_loss
+
+    def compute_disjoint_loss(self, box_dists):
+
+        total_disjoint_loss = torch.tensor(0.0, device=self.device)
+        num_box_dists = box_dists.mu_min.shape[0]
+
+        if "intersection_volume" in self.model_config["disjoint_loss_method"]:
+            intersection_box_dists = pairwise_gumbel_intersection(
+                box_dists,
+                box_dists
+            ) # Internal parameter shape: (N, N, D)
+            log_intersection_volumes = bessel_volume(intersection_box_dists, volume_temp = 0.1, log_scale = True) # (N, N)
+            intersection_volumes = torch.exp(log_intersection_volumes) # (N, N)
+
+            mask = torch.eye(num_box_dists, device=intersection_volumes.device).bool()
+            volumes_masked = intersection_volumes.masked_fill(mask, 0.0)
+            total_disjoint_loss += (volumes_masked.sum() / (num_box_dists * (num_box_dists - 1)))*100
+
+        elif "centroid_distance" in self.model_config["disjoint_loss_method"]:
+            # box_dist_centroids = (box_dists.mu_min + box_dists.mu_max)/2 # (N, D)
+            # box_dist_centroids_A = box_dist_centroids.unsqueeze(0) # (1, N, D)
+            # box_dist_centroids_B = box_dist_centroids.unsqueeze(1) # (N, 1, D)
+
+            # centroid_distances = torch.sum((box_dist_centroids_A - box_dist_centroids_B)**2, dim = -1) # (N, N)
+            # mask = torch.eye(num_box_dists, device=centroid_distances.device).bool()
+            # centroid_distances_masked = centroid_distances.masked_fill(mask, 0.0)
+            # total_disjoint_loss += -(centroid_distances_masked.sum() / (num_box_dists * (num_box_dists - 1)))
+
+            box_dist_centroids = (box_dists.mu_min + box_dists.mu_max) / 2
+            dists = torch.cdist(box_dist_centroids, box_dist_centroids, p=2) 
+            
+            margin = 0.3
+            pairwise_repulsion = F.relu(margin - dists)
+            
+            mask = torch.eye(num_box_dists, device=pairwise_repulsion.device).bool()
+            pairwise_repulsion = pairwise_repulsion.masked_fill(mask, 0.0)
+            
+            total_disjoint_loss += pairwise_repulsion.sum() / (num_box_dists * (num_box_dists - 1))
+
+        return total_disjoint_loss
 
     def on_train_epoch_end(self):
         
@@ -449,7 +595,3 @@ class HierarchicalBoxVAE(L.LightningModule):
             raise ValueError(
                 f"Optimizer type {self.config['trainer']['optimizer']['type']} not implemented."
             )
-
-
-
-

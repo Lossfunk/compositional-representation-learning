@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .box_utils import BoxEmbeddingDistribution
+from .box_utils import BoxDistribution
 
 class BoxEmbedVAE(nn.Module):
     def __init__(self, vae_config, embed_dim, input_resolution=(64, 64), beta_scale=0.4, beta_pre_init=-3.0, beta_activation="sigmoid"):
@@ -100,7 +100,7 @@ class BoxEmbedVAE(nn.Module):
         batch_size = input.shape[0]
         batch_mu_min, batch_mu_max, batch_beta_min, batch_beta_max = self.encode(input)
 
-        batch_box_dists = BoxEmbeddingDistribution(batch_mu_min, batch_mu_max, batch_beta_min, batch_beta_max)
+        batch_box_dists = BoxDistribution(batch_mu_min, batch_mu_max, batch_beta_min, batch_beta_max)
         batch_samples_min, batch_samples_max = batch_box_dists.sample()
         batch_samples = torch.concat([batch_samples_min, batch_samples_max], dim = -1)
         batch_reconstructions = self.decode(batch_samples)
