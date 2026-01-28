@@ -21,6 +21,13 @@ model:
         sparse_init: True
         num_init_connections: 6
         logit_value: 0.4
+    pull_loss_method: corner_distance
+    pull_assignment_temperature: 0.5
+    pull_assignment_activation: gumbel_softmax
+    pull_assignment_hard: True
+    pull_loss_start_epoch: 0
+    pull_loss_warmup_epochs: 5
+    disjoint_loss_method: ["intersection_volume"]
     loss_weights:
       patch_pull_loss: 1.0
       full_image_pull_loss: 0.0
@@ -32,6 +39,10 @@ model:
       l1_entropy_loss: 0.0
       l0_vol_penalty: 0.0
       l1_vol_penalty: 0.0
+      l0_disjoint_loss: 0.0
+      l1_disjoint_loss: 0.0
+      patch_disjoint_loss: 0.0
+      full_image_disjoint_loss: 0.0
 
 data:
   train:

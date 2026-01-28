@@ -1,0 +1,88 @@
+model:
+  type: HierarchicalBoxVAE
+  config:
+    embed_dim: 8
+    grid_size:
+    - 4
+    - 4
+    input_resolution:
+    - 64
+    - 64
+    crop_padding_range:
+    - 4
+    - 8
+    beta_scale: 0.4
+    beta_pre_init: -2.0
+    beta_activation: sigmoid
+    vae_config:
+      hidden_dims:
+      - 32
+      - 64
+      - 128
+      - 256
+    prior_config:
+      boxes_per_level:
+      - 64
+      - 16
+      gumbel_temp: 0.5
+      gumbel_hard: false
+      init_config:
+        center_variance: 0.8
+        width_variance: 0.2
+        min_width: 0.01
+        sparse_init: false
+        num_init_connections: 8
+        logit_value: 1.0
+    pull_loss_method: box_likelihood
+    pull_assignment_temperature: 0.5
+    pull_assignment_activation: softmax
+    pull_assignment_hard: false
+    pull_loss_start_epoch: 10
+    pull_loss_warmup_epochs: 20
+    disjoint_loss_method:
+    - intersection_volume
+    loss_weights:
+      patch_pull_loss: 0.5
+      full_image_pull_loss: 0.1
+      patch_mse_loss: 500.0
+      patch_ssim_loss: 10.0
+      full_image_mse_loss: 100.0
+      full_image_ssim_loss: 10.0
+      l0_entropy_loss: 0.5
+      l1_entropy_loss: 0.1
+      l0_vol_penalty: 0.1
+      l1_vol_penalty: 0.1
+      l0_disjoint_loss: 10.0
+      l1_disjoint_loss: 1.0
+      patch_disjoint_loss: 0.0
+      full_image_disjoint_loss: 0.0
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size:
+      - 64
+      - 64
+      shapes:
+      - circle
+      - square
+      colors:
+      - red
+      num_samples: 1000
+      return_metadata: true
+      center_range:
+      - 16
+      - 48
+      size_range:
+      - 10
+      - 30
+    dataloader_config:
+      batch_size: 32
+      shuffle: true
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      vae_lr: 0.0001
+      prior_lr: 0.0001

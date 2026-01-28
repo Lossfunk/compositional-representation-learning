@@ -1,4 +1,8 @@
 import random
+import csv
+import os
+import json
+from pathlib import Path
 
 import torch
 import torchvision
@@ -54,6 +58,11 @@ class HierarchicalBoxVAE(L.LightningModule):
         )
 
         self.viz_datapoint = None
+        
+        # Setup CSV logging
+        self.csv_log_file = None
+        self.csv_writer = None
+        self.csv_initialized = False
 
     def forward(self, x):
         images = x["images"]
@@ -95,8 +104,8 @@ class HierarchicalBoxVAE(L.LightningModule):
             all_box_dists.beta_max[num_total_patches:]
         ) # Internal parameter shape: (B, D)
 
-        patch_samples = vae_out["samples"][:num_total_patches]
-        full_image_samples = vae_out["samples"][num_total_patches:]
+        patch_samples = vae_out["samples"][:num_total_patches] # (B*N, 2D)
+        full_image_samples = vae_out["samples"][num_total_patches:] # (N, 2D)
 
         return {
             "images": images,
@@ -120,8 +129,8 @@ class HierarchicalBoxVAE(L.LightningModule):
         patch_box_dists = output["patch_box_dists"] # Internal parameter shape: (B*N, D)
         full_image_box_dists = output["full_image_box_dists"] # Internal parameter shape: (B, D)
 
-        patch_samples = output["patch_samples"]
-        full_image_samples = output["full_image_samples"]
+        patch_samples = output["patch_samples"] # (B*N, 2D)
+        full_image_samples = output["full_image_samples"] # (N, 2D)
 
         prior_box_dists = self.prior()
         patch_prior_box_dists = prior_box_dists[0] # Internal parameter shape: (1, N_L0, D)
@@ -235,6 +244,10 @@ class HierarchicalBoxVAE(L.LightningModule):
         }
         self.log_dict(loss_dict, prog_bar=True, on_epoch=True)
 
+        json_safe_dict = {k: v.item() if hasattr(v, 'item') else v for k, v in loss_dict.items()}
+        with open(f"/mnt/home/ubuntu/workspace/code/compositional-representation-learning/tmp/research-copilot-artifacts/test/loss_scalars__{self.current_epoch}__{batch_idx}.json", "w") as file_handle:
+            json.dump(json_safe_dict, file_handle)
+
         if self.viz_datapoint is None:
             N = self.grid_size[0] * self.grid_size[1]
             self.viz_datapoint = {
@@ -332,19 +345,30 @@ class HierarchicalBoxVAE(L.LightningModule):
         assignment_activation = self.model_config.get("pull_assignment_activation", "softmax")
         assignment_hard = self.model_config.get("pull_assignment_hard", False) 
 
-        intersection_box_dists = pairwise_gumbel_intersection(
-            computed_box_dists,
-            prior_box_dists
-        ) # Internal parameter shape: (N, M, D)
-        intersection_volume = bessel_volume(intersection_box_dists, volume_temp = 0.1, log_scale = True) # (N, M)
-        if assignment_activation == "softmax":
-            prior_assignment_probs = F.softmax(intersection_volume / assignment_temp, dim = -1).detach() # (N, M)
-        elif assignment_activation == "gumbel_softmax":
-            prior_assignment_probs = F.gumbel_softmax(intersection_volume, tau=assignment_temp, hard=assignment_hard, dim = -1) # (N, M)
-
-
         samples_min = computed_box_samples[..., :self.embed_dim].unsqueeze(1) # (N, 1, D)
         samples_max = computed_box_samples[..., self.embed_dim:].unsqueeze(1) # (N, 1, D)
+
+        prior_min = prior_box_dists.mu_min.unsqueeze(0) # (1, M, D)
+        prior_max = prior_box_dists.mu_max.unsqueeze(0) # (1, M, D)
+
+        pull_assignment_method = self.model_config.get("pull_assignment_method", "box_intersection")
+        if pull_assignment_method == "box_intersection":
+            intersection_box_dists = pairwise_gumbel_intersection(
+                computed_box_dists,
+                prior_box_dists
+            ) # Internal parameter shape: (N, M, D)
+            intersection_volume = bessel_volume(intersection_box_dists, volume_temp = 0.1, log_scale = True) # (N, M)
+            assignment_logits = intersection_volume
+        elif pull_assignment_method == "corner_distance":
+            min_dist_sq = torch.sum((prior_min - samples_min)**2, dim=-1) # (N, M)
+            max_dist_sq = torch.sum((prior_max - samples_max)**2, dim=-1) # (N, M)
+            total_dist_sq = min_dist_sq + max_dist_sq # (N, M)
+            assignment_logits = -total_dist_sq
+        
+        if assignment_activation == "softmax":
+            prior_assignment_probs = F.softmax(assignment_logits / assignment_temp, dim = -1) # (N, M)
+        elif assignment_activation == "gumbel_softmax":
+            prior_assignment_probs = F.gumbel_softmax(assignment_logits, tau=assignment_temp, hard=assignment_hard, dim = -1) # (N, M)
 
         prior_box_dists_expanded = BoxDistribution(
             prior_box_dists.mu_min.unsqueeze(0),
@@ -353,33 +377,49 @@ class HierarchicalBoxVAE(L.LightningModule):
             prior_box_dists.beta_max.unsqueeze(0)
         ) # Internal parameter shape: (1, M, D)
 
-        if self.model_config["pull_loss_method"] == "box_likelihood":
+        pull_loss_method = self.model_config.get("pull_loss_method", "box_likelihood")
+
+        if pull_loss_method == "box_likelihood":
             log_probs = self.compute_box_log_prob(
                 samples_min,
                 samples_max,
                 prior_box_dists_expanded
             ) # (N, M, D)
             log_likelihoods = log_probs.sum(dim=-1) # (N, M)
-            per_sample_loss = -torch.sum(prior_assignment_probs * log_likelihoods, dim=1) # (N,)
+            per_sample_loss = -torch.sum(prior_assignment_probs.detach() * log_likelihoods, dim=1) # (N,)
 
-        elif self.model_config["pull_loss_method"] == "containment":
+        elif pull_loss_method == "containment":
             violation_min = F.relu(prior_box_dists_expanded.mu_min - samples_min) # (N, M, D)
             violation_max = F.relu(samples_max - prior_box_dists_expanded.mu_max) # (N, M, D)
             
             geometric_distance = (violation_min + violation_max).sum(dim=-1) # (N, M)
-            per_sample_loss = torch.sum(prior_assignment_probs * geometric_distance, dim=1) # (N,)
+            per_sample_loss = torch.sum(prior_assignment_probs.detach() * geometric_distance, dim=1) # (N,)
 
-        elif self.model_config["pull_loss_method"] == "corner_distance":
+        elif pull_loss_method == "corner_distance":
             min_corner_dist = torch.sum((prior_box_dists_expanded.mu_min - samples_min)**2, dim = -1) # (N, M)
             max_corner_dist = torch.sum((prior_box_dists_expanded.mu_max - samples_max)**2, dim = -1) # (N, M)
 
             total_corner_dist = min_corner_dist + max_corner_dist # (N, M)
-            per_sample_loss = torch.sum(total_corner_dist, dim = 1) # (N,)
-        
+            per_sample_loss = torch.sum(prior_assignment_probs.detach() * total_corner_dist, dim = 1) # (N,)
+
         else:
             raise ValueError(
-                f"Pull Loss method {self.model_config["pull_loss_method"]} not implemented."
+                f"Pull Loss method {pull_loss_method} not implemented."
             )
+
+        if self.model_config.get("inverse_density_weighting", False):
+            sigma = self.model_config.get("idw_sigma", 1.0)
+            alpha = self.model_config.get("idw_alpha", 1.0)
+            
+            samples_detached = computed_box_samples.detach()
+            sample_dists = torch.cdist(samples_detached, samples_detached, p=2)
+
+            density = torch.sum(torch.exp(-sample_dists / sigma), dim=1)
+            raw_weights = 1.0 / (torch.pow(density, alpha) + 1e-6)
+            pull_weights = raw_weights / raw_weights.mean()
+            # pull_weights = torch.clamp(pull_weights, max=20.0)
+            
+            per_sample_loss = per_sample_loss * pull_weights
 
         pull_loss = per_sample_loss.mean()
 
@@ -425,7 +465,9 @@ class HierarchicalBoxVAE(L.LightningModule):
         total_disjoint_loss = torch.tensor(0.0, device=self.device)
         num_box_dists = box_dists.mu_min.shape[0]
 
-        if "intersection_volume" in self.model_config["disjoint_loss_method"]:
+        disjoint_loss_method = self.model_config.get("disjoint_loss_method", ["intersection_volume"])
+
+        if "intersection_volume" in disjoint_loss_method:
             intersection_box_dists = pairwise_gumbel_intersection(
                 box_dists,
                 box_dists
@@ -437,7 +479,7 @@ class HierarchicalBoxVAE(L.LightningModule):
             volumes_masked = intersection_volumes.masked_fill(mask, 0.0)
             total_disjoint_loss += (volumes_masked.sum() / (num_box_dists * (num_box_dists - 1)))*100
 
-        elif "centroid_distance" in self.model_config["disjoint_loss_method"]:
+        if "centroid_distance" in disjoint_loss_method:
             # box_dist_centroids = (box_dists.mu_min + box_dists.mu_max)/2 # (N, D)
             # box_dist_centroids_A = box_dist_centroids.unsqueeze(0) # (1, N, D)
             # box_dist_centroids_B = box_dist_centroids.unsqueeze(1) # (N, 1, D)
@@ -456,6 +498,34 @@ class HierarchicalBoxVAE(L.LightningModule):
             mask = torch.eye(num_box_dists, device=pairwise_repulsion.device).bool()
             pairwise_repulsion = pairwise_repulsion.masked_fill(mask, 0.0)
             
+            total_disjoint_loss += pairwise_repulsion.sum() / (num_box_dists * (num_box_dists - 1))
+
+        if "gaussian_soft_repulsion" in disjoint_loss_method:
+
+            box_dist_centroids = (box_dists.mu_min + box_dists.mu_max) / 2
+            dists = torch.cdist(box_dist_centroids, box_dist_centroids, p=2) 
+
+            sigma = 0.5 
+            pairwise_repulsion = torch.exp(- (dists**2) / (2 * sigma**2))
+
+            mask = torch.eye(num_box_dists, device=pairwise_repulsion.device).bool()
+            pairwise_repulsion = pairwise_repulsion.masked_fill(mask, 0.0)
+
+            total_disjoint_loss += pairwise_repulsion.sum() / (num_box_dists * (num_box_dists - 1))
+
+        if "inverse_distance" in disjoint_loss_method:
+            box_dist_centroids = (box_dists.mu_min + box_dists.mu_max) / 2
+            dists = torch.cdist(box_dist_centroids, box_dist_centroids, p=2) 
+            
+            # Inverse Distance Repulsion
+            # Adds infinite penalty as distance -> 0
+            epsilon = 1e-4 # Avoid division by zero
+            pairwise_repulsion = 1.0 / (dists + epsilon)
+            
+            mask = torch.eye(num_box_dists, device=pairwise_repulsion.device).bool()
+            pairwise_repulsion = pairwise_repulsion.masked_fill(mask, 0.0)
+            
+            # Normalize by number of pairs
             total_disjoint_loss += pairwise_repulsion.sum() / (num_box_dists * (num_box_dists - 1))
 
         return total_disjoint_loss
