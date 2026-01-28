@@ -1,0 +1,92 @@
+disjoint_loss_method:
+- intersection_volume
+init_config:
+  center_variance: 0.2
+  logit_value: 1
+  min_width: 0.1
+  num_init_connections: 2
+  sparse_init: true
+  width_variance: 0.2
+loss_weights:
+  full_image_disjoint_loss: 0.5
+  full_image_mse_loss: 1
+  full_image_pull_loss: 1
+  full_image_ssim_loss: 1
+  l0_disjoint_loss: 2
+  l0_entropy_loss: 5
+  l0_vol_penalty: 0.1
+  l1_disjoint_loss: 1
+  l1_entropy_loss: 1
+  l1_vol_penalty: 0.1
+  patch_disjoint_loss: 0.5
+  patch_mse_loss: 1
+  patch_pull_loss: 5
+  patch_ssim_loss: 1
+model:
+  config:
+  - embed_dim
+  - grid_size
+  - input_resolution
+  - crop_padding_range
+  - beta_scale
+  - beta_pre_init
+  - beta_activation
+  - vae_config
+  - prior_config
+  - pull_loss_method
+  - pull_assignment_temperature
+  - pull_assignment_activation
+  - pull_assignment_hard
+  - pull_loss_start_epoch
+  - pull_loss_warmup_epochs
+  - disjoint_loss_method
+  - loss_weights
+  init_config:
+  - center_variance
+  - width_variance
+  - min_width
+  - sparse_init
+  - num_init_connections
+  - logit_value
+  loss_weights:
+  - patch_pull_loss
+  - full_image_pull_loss
+  - patch_mse_loss
+  - patch_ssim_loss
+  - full_image_mse_loss
+  - full_image_ssim_loss
+  - l0_entropy_loss
+  - l1_entropy_loss
+  - l0_vol_penalty
+  - l1_vol_penalty
+  - l0_disjoint_loss
+  - l1_disjoint_loss
+  - patch_disjoint_loss
+  - full_image_disjoint_loss
+  prior_config:
+  - boxes_per_level
+  - gumbel_temp
+  - gumbel_hard
+  - init_config
+  type: HierarchicalBoxVAE
+  vae_config:
+  - hidden_dims
+prior_config:
+  boxes_per_level:
+  - 64
+  - 16
+  gumbel_hard: false
+  gumbel_temp: 0.5
+  init_config:
+  - center_variance
+  - width_variance
+  - min_width
+  - sparse_init
+  - num_init_connections
+  - logit_value
+pull_assignment_activation: softmax
+pull_assignment_hard: false
+pull_assignment_temperature: 0.1
+pull_loss_method: box_likelihood
+pull_loss_start_epoch: 10
+pull_loss_warmup_epochs: 20

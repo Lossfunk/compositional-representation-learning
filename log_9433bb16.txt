@@ -1,0 +1,14 @@
+/home/ubuntu/miniconda3/envs/vh-crl/lib/python3.13/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/home/ubuntu/miniconda3/envs/vh-crl/lib/python3.13/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+AllenNLP not available. Registrable won't work.
+Traceback (most recent call last):
+  File "/mnt/home/ubuntu/workspace/code/compositional-representation-learning/train.py", line 54, in <module>
+    pl_module = get_module(config)
+  File "/mnt/home/ubuntu/workspace/code/compositional-representation-learning/pl_modules/__init__.py", line 19, in get_module
+    return HierarchicalBoxVAE(config)
+  File "/mnt/home/ubuntu/workspace/code/compositional-representation-learning/pl_modules/HierarchicalBoxVAE/HierarchicalBoxVAE.py", line 26, in __init__
+    self.vae_config = self.model_config["vae_config"]
+                      ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+TypeError: list indices must be integers or slices, not str
