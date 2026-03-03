@@ -32,6 +32,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Run in test mode",
     )
+    parser.add_argument(
+        "--experiment_id",
+        type=str,
+        help="Explicit experiment ID",
+    )
 
     args = parser.parse_args()
     with open(args.config_filepath, "r") as file_handle:
@@ -42,9 +47,12 @@ if __name__ == "__main__":
 
     experiment_name = pathlib.Path(args.config_filepath).stem
     experiment_type = config["model"]["type"]
-    experiment_id = experiment_name + "___" + datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
-    if args.test_mode:
-        experiment_id = f"test_{experiment_id}"
+    if args.experiment_id:
+        experiment_id = args.experiment_id
+    else:
+        experiment_id = experiment_name + "___" + datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
+        if args.test_mode:
+            experiment_id = f"test_{experiment_id}"
     experiment_dir = (
         pathlib.Path(experiment_root_dir) / experiment_type / experiment_name / experiment_id
     )
@@ -55,7 +63,7 @@ if __name__ == "__main__":
     train_dataset = get_dataset(config)
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, **config["data"]["train"]["dataloader_config"]
+        train_dataset, **config["data"]["train"].get("dataloader_config", {"batch_size": 32, "shuffle": True, "num_workers": 4})
     )
 
     wandb_logger = WandbLogger(project="compositional-representation-learning", name=experiment_id)

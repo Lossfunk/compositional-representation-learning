@@ -21,6 +21,8 @@ from .box_utils import BoxDistribution, soft_box_weighted_intersection, pairwise
 class HierarchicalBoxVAE(L.LightningModule):
     def __init__(self, config):
         super().__init__()
+        print("Initializing HierarchicalBoxVAE")
+        print("HierarchicalBoxVAE init method called - experiment print statement")
         self.config = config
         self.model_config = config["model"]["config"]
         self.vae_config = self.model_config["vae_config"]
