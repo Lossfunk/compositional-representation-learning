@@ -30,16 +30,16 @@ model:
         mlp_ratio: 4.0
     loss_weights:
       reconstruction_loss: 1.0
-      singleton_obj_rank_loss: 1.0
-      concept_similarity_loss: 1.0
-      union_consistency_loss: 1.0
+      singleton_obj_rank_loss: 0.0
+      concept_similarity_loss: 0.0
+      union_consistency_loss: 0.0
       galois_attr_loss: 1.0
       galois_obj_loss: 1.0
-      loss_obj_card_prop: 1.0
-      loss_attr_card_inv_prop: 1.0
-      loss_attr_obj_inv_prop: 1.0
-      repulsion_loss_obj: 1.0
-      repulsion_loss_attr: 1.0
+      loss_obj_card_prop: 0.0
+      loss_attr_card_inv_prop: 0.0
+      loss_attr_obj_inv_prop: 0.0
+      repulsion_loss_obj: 0.0
+      repulsion_loss_attr: 0.0
     
 data:
   train:

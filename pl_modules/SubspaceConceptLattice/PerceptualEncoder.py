@@ -17,15 +17,15 @@ class ViTEncoder(nn.Module):
         self.mlp_ratio = config["mlp_ratio"]
         self.num_patches = (self.image_size // self.patch_size) ** 2
 
-        # 1. Patchify and project to embedding dimension
+        # Patchify and project to embedding dimension
         self.patch_embed = nn.Conv2d(
             self.in_channels, self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
         )
         
-        # 2. Learnable positional embeddings
+        # Learnable positional embeddings
         self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches, self.embed_dim))
         
-        # 3. Transformer Encoder layers
+        # Transformer Encoder layers
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embed_dim, 
             nhead=self.heads, 
@@ -38,18 +38,16 @@ class ViTEncoder(nn.Module):
         self.norm = nn.LayerNorm(self.embed_dim)
 
     def forward(self, x):
-        # x shape: (B, C, H, W)
         B = x.shape[0]
         
         # Patchify -> (B, embed_dim, H/P, W/P) -> (B, embed_dim, num_patches) -> (B, num_patches, embed_dim)
-        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        x = self.patch_embed(x).flatten(2).transpose(1, 2) # (B, num_patches, embed_dim)
         
         # Add positional embeddings
-        x = x + self.pos_embed
+        x = x + self.pos_embed # (B, num_patches, embed_dim)
         
         # Pass through transformer
-        x = self.transformer(x)
-        x = self.norm(x)
+        x = self.transformer(x) # (B, num_patches, embed_dim)
+        x = self.norm(x) # (B, num_patches, embed_dim)
         
-        # Returns shape: (B, num_patches, embed_dim)
         return x

@@ -33,6 +33,7 @@ class SubspaceConceptLattice(L.LightningModule):
         self.image_channels = self.model_config["image_channels"]
 
         self.max_samples_per_cardinality = self.model_config["max_samples_per_cardinality"]
+        self.loss_weights = self.model_config["loss_weights"]
 
         if self.model_config["perceptual_encoder"]["type"] == "ViTEncoder":
             perceptual_encoder_config = self.model_config["perceptual_encoder"]["config"]
@@ -42,6 +43,7 @@ class SubspaceConceptLattice(L.LightningModule):
                 "image_channels": self.image_channels,
             })
             self.perceptual_encoder = ViTEncoder(perceptual_encoder_config)
+        
         if self.model_config["concept_encoder"]["type"] == "ConceptEncoder":
             concept_encoder_config = self.model_config["concept_encoder"]["config"]
             concept_encoder_config.update({
@@ -52,6 +54,7 @@ class SubspaceConceptLattice(L.LightningModule):
                 "lbd": self.lbd,
             })
             self.concept_encoder = ConceptEncoder(concept_encoder_config)
+        
         if self.model_config["decoder"]["type"] == "ViTDecoder":
             decoder_config = self.model_config["decoder"]["config"]
             decoder_config.update({
@@ -99,7 +102,7 @@ class SubspaceConceptLattice(L.LightningModule):
 
         singletons_mask = (cardinalities_tensor == 1)
         X_attr_singletons = X_attr_tensor[singletons_mask] # (B, n_attr, d_ambient)
-        X_attr_singletons_dec = self.concept_encoder.mlp_attr_decoder(X_attr_singletons) # (B, n_attr, embed_dim)
+        X_attr_singletons_dec = self.concept_encoder.attr_dec(X_attr_singletons) # (B, n_attr, embed_dim)
 
         reconstructed_images = self.decoder(X_attr_singletons_dec) # (B, 3, H, W)
 
@@ -141,22 +144,25 @@ class SubspaceConceptLattice(L.LightningModule):
                 "reconstructed_images": reconstructed_images[:num_samples].detach().cpu(),
             }
 
-        # Reconstruction Loss
-        recon_loss = F.mse_loss(reconstructed_images, images, reduction="sum") / B
+        # LOSS COMPUTATIONS
 
+        ## Reconstruction Loss
+        reconstruction_loss = F.mse_loss(reconstructed_images, images, reduction="sum") / B
+
+        ## Singleton Object Rank Loss
         singleton_obj_ranks = torch.einsum("bii->b", P_obj_singletons) 
-        singleton_rank_loss = F.mse_loss(singleton_obj_ranks, torch.ones_like(singleton_obj_ranks))
+        singleton_obj_rank_loss = F.mse_loss(singleton_obj_ranks, torch.ones_like(singleton_obj_ranks))
 
-        singleton_attr_ranks = torch.einsum("bii->b", P_attr_singletons)
-        attr_compression_loss = singleton_attr_ranks.mean()
-
+        ## Concept Similarity Loss
         concept_similarity_loss = self.compute_proportional_similarity_loss(
-            P_attr_singletons, 
+            P_attr_singletons,
             P_obj_singletons
         )
 
+        ## Union Consistency Loss
         total_union_consistency_loss = 0
 
+        ## Galois Loss
         total_galois_attr_loss = 0
         total_galois_obj_loss = 0
         total_comparisons = 0
@@ -186,15 +192,15 @@ class SubspaceConceptLattice(L.LightningModule):
             P_obj_c_flat = P_obj_comb_exp.reshape(-1, self.ambient_dim, self.ambient_dim) # (num_combos * k, ambient_dim, ambient_dim)
             P_obj_s_flat = combo_singletons_P_obj.reshape(-1, self.ambient_dim, self.ambient_dim) # (num_combos * k, ambient_dim, ambient_dim)
 
-            galois_attr_loss = get_inclusion(P_sub=P_attr_c_flat, P_super=P_attr_s_flat) # (num_combos * k,)
-            galois_obj_loss = get_inclusion(P_sub=P_obj_s_flat, P_super=P_obj_c_flat) # (num_combos * k,)
+            galois_attr_inclusion = get_inclusion(P_sub=P_attr_c_flat, P_super=P_attr_s_flat) # (num_combos * k,)
+            galois_obj_inclusion = get_inclusion(P_sub=P_obj_s_flat, P_super=P_obj_c_flat) # (num_combos * k,)
 
-            attr_target = torch.ones_like(galois_attr_loss) # (num_combos * k,)
-            obj_target = torch.ones_like(galois_obj_loss) # (num_combos * k,)
+            attr_target = torch.ones_like(galois_attr_inclusion) # (num_combos * k,)
+            obj_target = torch.ones_like(galois_obj_inclusion) # (num_combos * k,)
 
-            total_galois_attr_loss += F.binary_cross_entropy(galois_attr_loss, attr_target, reduction="sum")
-            total_galois_obj_loss += F.binary_cross_entropy(galois_obj_loss, obj_target, reduction="sum")
-            total_comparisons += galois_attr_loss.shape[0]
+            total_galois_attr_loss += F.binary_cross_entropy(galois_attr_inclusion, attr_target, reduction="sum")
+            total_galois_obj_loss += F.binary_cross_entropy(galois_obj_inclusion, obj_target, reduction="sum")
+            total_comparisons += num_combos * cardinality
 
         union_consistency_loss = total_union_consistency_loss / max(1, (B_total - B))
 
@@ -205,29 +211,42 @@ class SubspaceConceptLattice(L.LightningModule):
         obj_ranks = torch.einsum("bii->b", P_obj_tensor)
         attr_ranks = torch.einsum("bii->b", P_attr_tensor)
 
-        # 1. Object rank is directly proportional to cardinality
-        loss_obj_card = self.proportionality_loss(cardinalities, obj_ranks, inverse=False)
-        # 2. Attribute rank is inversely proportional to cardinality
-        loss_attr_card = self.proportionality_loss(cardinalities, attr_ranks, inverse=True)
-        # 3. Inverse proportionality across the concept space (attributes vs objects)
-        loss_attr_obj = self.proportionality_loss(attr_ranks, obj_ranks, inverse=True)
+        ## Proportionality Losses
+        ### Object rank is directly proportional to cardinality
+        loss_obj_card_prop = self.proportionality_loss(cardinalities, obj_ranks, inverse=False)
+        ### Attribute rank is inversely proportional to cardinality
+        loss_attr_card_inv_prop = self.proportionality_loss(cardinalities, attr_ranks, inverse=True)
+        ### Inverse proportionality across the concept space (attributes vs objects)
+        loss_attr_obj_inv_prop = self.proportionality_loss(attr_ranks, obj_ranks, inverse=True)
 
+        ## Repulsion Losses
         repulsion_loss_obj = self.compute_soft_repulsion(P_obj_singletons)
         repulsion_loss_attr = self.compute_soft_repulsion(P_attr_singletons)
 
-        total_loss = recon_loss + singleton_rank_loss + union_consistency_loss + galois_attr_loss + galois_obj_loss + concept_similarity_loss + loss_obj_card + loss_attr_card + loss_attr_obj + repulsion_loss_obj + repulsion_loss_attr
+        total_loss = (
+            self.loss_weights["reconstruction_loss"] * reconstruction_loss +
+            self.loss_weights["singleton_obj_rank_loss"] * singleton_obj_rank_loss +
+            self.loss_weights["concept_similarity_loss"] * concept_similarity_loss +
+            self.loss_weights["union_consistency_loss"] * union_consistency_loss +
+            self.loss_weights["galois_attr_loss"] * galois_attr_loss +
+            self.loss_weights["galois_obj_loss"] * galois_obj_loss +
+            self.loss_weights["loss_obj_card_prop"] * loss_obj_card_prop +
+            self.loss_weights["loss_attr_card_inv_prop"] * loss_attr_card_inv_prop +
+            self.loss_weights["loss_attr_obj_inv_prop"] * loss_attr_obj_inv_prop +
+            self.loss_weights["repulsion_loss_obj"] * repulsion_loss_obj +
+            self.loss_weights["repulsion_loss_attr"] * repulsion_loss_attr
+        )
 
         loss_dict = {
-            "recon_loss": recon_loss,
-            "singleton_rank_loss": singleton_rank_loss,
+            "reconstruction_loss": reconstruction_loss,
+            "singleton_obj_rank_loss": singleton_obj_rank_loss,
+            "concept_similarity_loss": concept_similarity_loss,
             "union_consistency_loss": union_consistency_loss,
             "galois_attr_loss": galois_attr_loss,
             "galois_obj_loss": galois_obj_loss,
-            "concept_similarity_loss": concept_similarity_loss,
-            "loss_obj_card": loss_obj_card,
-            "loss_attr_card": loss_attr_card,
-            "loss_attr_obj": loss_attr_obj,
-            "attr_compression_loss": attr_compression_loss,
+            "loss_obj_card_prop": loss_obj_card_prop,
+            "loss_attr_card_inv_prop": loss_attr_card_inv_prop,
+            "loss_attr_obj_inv_prop": loss_attr_obj_inv_prop,
             "repulsion_loss_obj": repulsion_loss_obj,
             "repulsion_loss_attr": repulsion_loss_attr,
             "total_loss": total_loss
@@ -257,24 +276,23 @@ class SubspaceConceptLattice(L.LightningModule):
         P_obj_vec = P_obj.reshape(B, -1)
         
         # Compute pairwise overlaps for the batch: Tr(P_i P_j) = vec(P_i)^T vec(P_j)
-        # Shape: (B, B)
-        overlap_attr = torch.matmul(P_attr_vec, P_attr_vec.transpose(0, 1))
-        overlap_obj = torch.matmul(P_obj_vec, P_obj_vec.transpose(0, 1))
+        overlap_attr = torch.matmul(P_attr_vec, P_attr_vec.transpose(0, 1)) # (B, B)
+        overlap_obj = torch.matmul(P_obj_vec, P_obj_vec.transpose(0, 1)) # (B, B)
         
         # Extract the diagonal (which represents the trace/rank of each individual projector)
-        norm_attr = torch.diag(overlap_attr).clamp(min=1e-6)
-        norm_obj = torch.diag(overlap_obj).clamp(min=1e-6)
+        norm_attr = torch.diag(overlap_attr).clamp(min=1e-6) # (B,)
+        norm_obj = torch.diag(overlap_obj).clamp(min=1e-6) # (B,)
         
         # Compute the denominator for cosine similarity normalization
-        denom_attr = torch.sqrt(norm_attr.unsqueeze(1) * norm_attr.unsqueeze(0))
-        denom_obj = torch.sqrt(norm_obj.unsqueeze(1) * norm_obj.unsqueeze(0))
+        denom_attr = torch.sqrt(norm_attr.unsqueeze(1) * norm_attr.unsqueeze(0)) # (B, B)
+        denom_obj = torch.sqrt(norm_obj.unsqueeze(1) * norm_obj.unsqueeze(0)) # (B, B)
         
         # Normalize to [0, 1] to enforce strict proportionality
-        sim_attr = overlap_attr / denom_attr
-        sim_obj = overlap_obj / denom_obj
+        sim_attr = overlap_attr / denom_attr # (B, B)
+        sim_obj = overlap_obj / denom_obj # (B, B)
         
         # Enforce Sim(S_attr) is proportional to Sim(S_obj)
-        sim_loss = F.mse_loss(sim_attr, sim_obj)
+        sim_loss = F.mse_loss(sim_attr, sim_obj) # Scalar
         
         return sim_loss
 
@@ -424,10 +442,12 @@ class SubspaceConceptLattice(L.LightningModule):
         sns.heatmap(obj_inclusion, annot=True, cmap="Blues", vmin=0, vmax=1, 
                     xticklabels=concept_labels, yticklabels=singleton_labels, ax=axes[0])
         axes[0].set_title("Object Subspace Inclusion: $P(S_{singleton}^{obj} \subseteq S_{concept}^{obj})$\n(Expect ~1 for valid combinations)")
+        axes[0].tick_params(axis='y', labelrotation=0)
         
         sns.heatmap(attr_inclusion, annot=True, cmap="Oranges", vmin=0, vmax=1, 
                     xticklabels=concept_labels, yticklabels=singleton_labels, ax=axes[1])
         axes[1].set_title("Attribute Subspace Inclusion: $P(S_{concept}^{attr} \subseteq S_{singleton}^{attr})$\n(Galois Reverse: Expect ~1 for valid combinations)")
+        axes[1].tick_params(axis='y', labelrotation=0)
         
         plt.tight_layout()
 

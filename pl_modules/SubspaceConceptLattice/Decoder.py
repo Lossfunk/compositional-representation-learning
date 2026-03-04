@@ -18,10 +18,10 @@ class ViTDecoder(nn.Module):
         self.num_patches = (self.image_size // self.patch_size) ** 2
         out_dim = self.out_channels * (self.patch_size ** 2)
         
-        # 1. Learnable spatial queries (one for each patch location)
+        # Learnable spatial queries (one for each patch location)
         self.spatial_queries = nn.Parameter(torch.randn(1, self.num_patches, self.embed_dim))
         
-        # 2. Transformer Decoder layers
+        # Transformer Decoder layers
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.embed_dim,
             nhead=self.heads,
@@ -33,27 +33,26 @@ class ViTDecoder(nn.Module):
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=self.depth)
         self.norm = nn.LayerNorm(self.embed_dim)
         
-        # 3. Project decoded tokens back to pixel patches
+        # Project decoded tokens back to pixel patches
         self.head = nn.ConvTranspose2d(self.embed_dim, self.out_channels, kernel_size=self.patch_size, stride=self.patch_size)
 
     def forward(self, concept_vectors):
-        # concept_vectors shape: (B, N, embed_dim)
-        B = concept_vectors.shape[0]
+        # Concept vectors represent the basis vectors for the attribute subspace
+        B = concept_vectors.shape[0] # (B, N, embed_dim)
         
-        # Expand spatial queries for the batch: (B, num_patches, embed_dim)
-        queries = self.spatial_queries.expand(B, -1, -1)
+        # Expand spatial queries for the batch
+        queries = self.spatial_queries.expand(B, -1, -1) # (B, num_patches, embed_dim)
         
         # Cross-attention: Queries ask the Concept Vectors for information
-        # tgt = queries, memory = concept_vectors
-        x = self.transformer(tgt=queries, memory=concept_vectors)
-        x = self.norm(x)
+        x = self.transformer(tgt=queries, memory=concept_vectors) # (B, num_patches, embed_dim)
+        x = self.norm(x) # (B, num_patches, embed_dim)
         
-        # Reshape to spatial feature map: (B, embed_dim, H/P, W/P)
+        # Reshape to spatial feature map
         H_P = self.image_size // self.patch_size
         W_P = self.image_size // self.patch_size
-        x = x.transpose(1, 2).reshape(B, self.embed_dim, H_P, W_P)
+        x = x.transpose(1, 2).reshape(B, self.embed_dim, H_P, W_P) # (B, embed_dim, H/P, W/P)
         
-        # Project to pixels using ConvTranspose2d: (B, C, H, W)
-        x = self.head(x)
+        # Project to pixel space using ConvTranspose2d
+        x = self.head(x) # (B, C, H, W)
         
         return x
