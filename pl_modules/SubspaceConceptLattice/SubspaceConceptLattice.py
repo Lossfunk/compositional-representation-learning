@@ -33,6 +33,9 @@ class SubspaceConceptLattice(L.LightningModule):
         self.image_channels = self.model_config["image_channels"]
 
         self.max_samples_per_cardinality = self.model_config["max_samples_per_cardinality"]
+        self.intersection_power_steps = self.model_config["intersection_power_steps"]
+        self.intersection_consistency_only_pairs = self.model_config["intersection_consistency_only_pairs"]
+        self.maximize_singleton_attr_rank = self.model_config["maximize_singleton_attr_rank"]
         self.loss_weights = self.model_config["loss_weights"]
 
         if self.model_config["perceptual_encoder"]["type"] == "ViTEncoder":
@@ -136,6 +139,7 @@ class SubspaceConceptLattice(L.LightningModule):
         P_attr_singletons = P_attr_tensor[singletons_mask] # (B, ambient_dim, ambient_dim)
         P_obj_singletons = P_obj_tensor[singletons_mask] # (B, ambient_dim, ambient_dim)
         X_obj_singletons = X_obj_tensor[singletons_mask] # (B, n_obj, ambient_dim)
+        X_attr_singletons = X_attr_tensor[singletons_mask] # (B, n_attr, ambient_dim)
         
         if self.viz_datapoint is None:
             num_samples = min(4, B)
@@ -153,6 +157,13 @@ class SubspaceConceptLattice(L.LightningModule):
         singleton_obj_ranks = torch.einsum("bii->b", P_obj_singletons) 
         singleton_obj_rank_loss = F.mse_loss(singleton_obj_ranks, torch.ones_like(singleton_obj_ranks))
 
+        ## Maximize Singleton Attribute Rank Loss
+        singleton_attr_ranks = torch.einsum("bii->b", P_attr_singletons) 
+        max_singleton_attr_rank_loss = -torch.mean(singleton_attr_ranks)
+
+        ## Attribute Orthogonality Loss
+        attr_orthogonality_loss = self.compute_orthogonality_loss(X_attr_singletons)
+
         ## Concept Similarity Loss
         concept_similarity_loss = self.compute_proportional_similarity_loss(
             P_attr_singletons,
@@ -161,6 +172,12 @@ class SubspaceConceptLattice(L.LightningModule):
 
         ## Union Consistency Loss
         total_union_consistency_loss = 0
+
+        ## Intersection Consistency Loss
+        total_intersection_consistency_loss = 0
+
+        ## Modular Subspace Loss
+        total_modular_subspace_loss = 0
 
         ## Galois Loss
         total_galois_attr_loss = 0
@@ -184,6 +201,25 @@ class SubspaceConceptLattice(L.LightningModule):
             P_obj_union = ridge_projector(X_obj_union_basis, lbd=self.lbd) # (num_combos, ambient_dim, ambient_dim)
             total_union_consistency_loss += F.mse_loss(cardinality_P_obj, P_obj_union, reduction="sum")
 
+            if self.intersection_consistency_only_pairs:
+                if cardinality == 2:
+                    Pi = combo_singletons_P_attr[:, 0] # (num_combos, ambient_dim, ambient_dim)
+                    Pj = combo_singletons_P_attr[:, 1] # (num_combos, ambient_dim, ambient_dim)
+                    combo_singletons_P_attr_inter = 0.5 * (Pi @ Pj + Pj @ Pi) # (num_combos, ambient_dim, ambient_dim)
+                    total_intersection_consistency_loss += F.mse_loss(cardinality_P_attr, combo_singletons_P_attr_inter, reduction="sum")
+
+                    Xi = combo_singletons_X_obj[:, 0] # (num_combos, n_obj, ambient_dim)
+                    Xj = combo_singletons_X_obj[:, 1] # (num_combos, n_obj, ambient_dim)
+                    Xi_union_Xj = torch.cat([Xi, Xj], dim=1) # (num_combos, 2 * n_obj, ambient_dim)
+                    Xi_union_Xj_P_attr = ridge_projector(Xi_union_Xj, lbd=self.lbd) # (num_combos, ambient_dim, ambient_dim)
+                    target_inter_rank = torch.einsum("bii->b", Pi) + torch.einsum("bii->b", Pj) - torch.einsum("bii->b", Xi_union_Xj_P_attr) # (num_combos,)
+                    actual_inter_rank = torch.einsum("bii->b", cardinality_P_attr) # (num_combos,)
+                    total_modular_subspace_loss += F.mse_loss(actual_inter_rank, target_inter_rank, reduction="sum")
+            else:
+                combo_singletons_P_attr_avg = torch.mean(combo_singletons_P_attr, dim=1) # (num_combos, ambient_dim, ambient_dim)
+                combo_singletons_P_attr_inter = torch.linalg.matrix_power(combo_singletons_P_attr_avg, self.intersection_power_steps) # (num_combos, ambient_dim, ambient_dim)
+                total_intersection_consistency_loss += F.mse_loss(cardinality_P_attr, combo_singletons_P_attr_inter, reduction="sum")
+
             P_attr_comb_exp = cardinality_P_attr.unsqueeze(1).expand(-1, cardinality, -1, -1) # (num_combos, k, ambient_dim, ambient_dim)
             P_obj_comb_exp = cardinality_P_obj.unsqueeze(1).expand(-1, cardinality, -1, -1) # (num_combos, k, ambient_dim, ambient_dim)
 
@@ -203,6 +239,12 @@ class SubspaceConceptLattice(L.LightningModule):
             total_comparisons += num_combos * cardinality
 
         union_consistency_loss = total_union_consistency_loss / max(1, (B_total - B))
+        if self.intersection_consistency_only_pairs:
+            intersection_consistency_loss = total_intersection_consistency_loss / 10
+            modular_subspace_loss = total_modular_subspace_loss / 10
+        else:
+            intersection_consistency_loss = total_intersection_consistency_loss / max(1, (B_total - B))
+            modular_subspace_loss = total_modular_subspace_loss / max(1, (B_total - B))
 
         galois_attr_loss = total_galois_attr_loss / max(1, total_comparisons)
         galois_obj_loss = total_galois_obj_loss / max(1, total_comparisons)
@@ -226,8 +268,12 @@ class SubspaceConceptLattice(L.LightningModule):
         total_loss = (
             self.loss_weights["reconstruction_loss"] * reconstruction_loss +
             self.loss_weights["singleton_obj_rank_loss"] * singleton_obj_rank_loss +
+            self.loss_weights["max_singleton_attr_rank_loss"] * max_singleton_attr_rank_loss +
+            self.loss_weights["modular_subspace_loss"] * modular_subspace_loss +
+            self.loss_weights["attr_orthogonality_loss"] * attr_orthogonality_loss +
             self.loss_weights["concept_similarity_loss"] * concept_similarity_loss +
             self.loss_weights["union_consistency_loss"] * union_consistency_loss +
+            self.loss_weights["intersection_consistency_loss"] * intersection_consistency_loss +
             self.loss_weights["galois_attr_loss"] * galois_attr_loss +
             self.loss_weights["galois_obj_loss"] * galois_obj_loss +
             self.loss_weights["loss_obj_card_prop"] * loss_obj_card_prop +
@@ -240,8 +286,12 @@ class SubspaceConceptLattice(L.LightningModule):
         loss_dict = {
             "reconstruction_loss": reconstruction_loss,
             "singleton_obj_rank_loss": singleton_obj_rank_loss,
+            "max_singleton_attr_rank_loss": max_singleton_attr_rank_loss,
+            "modular_subspace_loss": modular_subspace_loss,
+            "attr_orthogonality_loss": attr_orthogonality_loss,
             "concept_similarity_loss": concept_similarity_loss,
             "union_consistency_loss": union_consistency_loss,
+            "intersection_consistency_loss": intersection_consistency_loss,
             "galois_attr_loss": galois_attr_loss,
             "galois_obj_loss": galois_obj_loss,
             "loss_obj_card_prop": loss_obj_card_prop,
@@ -271,7 +321,7 @@ class SubspaceConceptLattice(L.LightningModule):
         """
         B, D, _ = P_attr.shape
         
-        # Vectorize projectors: (B, D*D)
+        # Vectorize projectors: (B, D*D)           
         P_attr_vec = P_attr.reshape(B, -1)
         P_obj_vec = P_obj.reshape(B, -1)
         
@@ -339,33 +389,63 @@ class SubspaceConceptLattice(L.LightningModule):
         # Return the mean of the off-diagonal overlaps
         return overlap[mask].mean()
 
+    def compute_orthogonality_loss(self, X):
+        """Encourages basis vectors to be orthogonal, maximizing subspace rank naturally."""
+        B, N, D = X.shape
+        # Compute Gram matrix
+        gram = torch.bmm(X, X.transpose(1, 2)) # (B, N, N)
+        
+        # Normalize to get cosine similarities
+        norms = torch.norm(X, dim=-1, keepdim=True) + 1e-8
+        gram_norm = gram / torch.bmm(norms, norms.transpose(1, 2))
+        
+        # Mask out the diagonal
+        mask = ~torch.eye(N, dtype=torch.bool, device=X.device).expand(B, N, N)
+        
+        # Penalize off-diagonal correlations
+        return (gram_norm[mask] ** 2).mean()
+
     @torch.no_grad()
     def log_concept_lattice_inclusion(self):
         """
-        Generates 4 ideal images using dataset transforms, forms the 9 formal concepts, 
-        and plots heatmaps of their subspace inclusions.
+        Generates ideal images using dataset transforms, forms the formal concepts
+        dynamically, and plots heatmaps of their subspace inclusions.
         """
         self.eval()
         
-        img_size = self.config["model"]["config"]["image_size"]
-        color_map = {"red": (255, 0, 0), "blue": (0, 0, 255)}
+        train_config = self.config["data"]["train"]["config"]
+        img_size = train_config.get("image_size", 64)
+        if isinstance(img_size, list) or isinstance(img_size, tuple):
+            img_size_x, img_size_y = img_size
+        else:
+            img_size_x = img_size_y = img_size
+
+        shapes = train_config.get("shapes", ["circle", "square"])
+        colors = train_config.get("colors", ["red", "blue", "green"])
+        
+        color_map = {"red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
+                     "yellow": (255, 255, 0), "cyan": (0, 255, 255), "magenta": (255, 0, 255),
+                     "white": (255, 255, 255), "black": (0, 0, 0)}
         
         # 1. Define the exact same transform used in v0Dataset
         default_transform = transforms.Compose([
             transforms.ToTensor(),
         ])
         
+        center_val = train_config.get("center_range", [32, 33])[0]
+        size_val = train_config.get("size_range", [20, 21])[0]
+
         def make_ideal_img(shape, color_name):
             # Create the base HWC uint8 numpy array just like generate_image()
-            img = np.zeros([img_size, img_size, 3], dtype=np.uint8)
-            color = color_map[color_name]
-            center = (32, 32)
+            img = np.zeros([img_size_x, img_size_y, 3], dtype=np.uint8)
+            color = color_map.get(color_name, (255, 255, 255))
+            center = (center_val, center_val)
             
             if shape == "circle":
-                radius = 10
+                radius = size_val // 2
                 cv2.circle(img, center, radius, color, -1)
             elif shape == "square":
-                side = 20
+                side = size_val
                 cv2.rectangle(img, 
                             (center[0] - side // 2, center[1] - side // 2), 
                             (center[0] + side // 2, center[1] + side // 2), 
@@ -377,34 +457,51 @@ class SubspaceConceptLattice(L.LightningModule):
             # Move to the correct device
             return img_tensor.to(self.device)
 
-        # Base singletons
-        rc = make_ideal_img("circle", "red")
-        bc = make_ideal_img("circle", "blue")
-        rs = make_ideal_img("square", "red")
-        bs = make_ideal_img("square", "blue")
+        # Generate all valid combinations dynamically
+        combinations = list(itertools.product(colors, shapes))
         
-        images = torch.stack([rc, bc, rs, bs]) # (4, 3, H, W)
-        singleton_labels = ["Red Circle", "Blue Circle", "Red Square", "Blue Square"]
+        images = []
+        singleton_labels = []
+        for c, s in combinations:
+            images.append(make_ideal_img(s, c))
+            singleton_labels.append(f"{c.capitalize()} {s.capitalize()}")
+        
+        images = torch.stack(images) # (num_singletons, 3, H, W)
+        num_singletons = len(combinations)
         
         # 2. Get perceptual representations
-        R = self.perceptual_encoder(images) # (4, num_patches, embed_dim)
+        R = self.perceptual_encoder(images) # (num_singletons, num_patches, embed_dim)
         
-        # 3. Define the 9 formal concepts by their constituent singleton indices
-        # Indices: 0:rc, 1:bc, 2:rs, 3:bs
-        concept_defs = {
-            "C0 (Universal)": [0, 1, 2, 3],
-            "C1 (Red)": [0, 2],
-            "C2 (Blue)": [1, 3],
-            "C3 (Circle)": [0, 1],
-            "C4 (Square)": [2, 3],
-            "C5 (Red Circle)": [0],
-            "C6 (Blue Circle)": [1],
-            "C7 (Red Square)": [2],
-            "C8 (Blue Square)": [3]
-        }
+        # 3. Define the formal concepts dynamically
+        concept_defs = {}
+        
+        # Universal concept
+        concept_defs["C0 (Universal)"] = list(range(num_singletons))
+        
+        concept_idx = 1
+        # Color concepts
+        for color in colors:
+            concept_defs[f"C{concept_idx} ({color.capitalize()})"] = [
+                i for i, (c, s) in enumerate(combinations) if c == color
+            ]
+            concept_idx += 1
+            
+        # Shape concepts
+        for shape in shapes:
+            concept_defs[f"C{concept_idx} ({shape.capitalize()})"] = [
+                i for i, (c, s) in enumerate(combinations) if s == shape
+            ]
+            concept_idx += 1
+            
+        # Singleton concepts
+        for i, (c, s) in enumerate(combinations):
+            concept_defs[f"C{concept_idx} ({c.capitalize()} {s.capitalize()})"] = [i]
+            concept_idx += 1
+            
         concept_labels = list(concept_defs.keys())
+        num_concepts = len(concept_labels)
         
-        # Extract projectors for the 9 concepts
+        # Extract projectors for all concepts
         P_attr_concepts = []
         P_obj_concepts = []
         
@@ -414,19 +511,19 @@ class SubspaceConceptLattice(L.LightningModule):
             P_attr_concepts.append(P_attr.squeeze(0)) # (ambient_dim, ambient_dim)
             P_obj_concepts.append(P_obj.squeeze(0))   # (ambient_dim, ambient_dim)
             
-        P_attr_concepts = torch.stack(P_attr_concepts) # (9, D, D)
-        P_obj_concepts = torch.stack(P_obj_concepts)   # (9, D, D)
+        P_attr_concepts = torch.stack(P_attr_concepts) # (num_concepts, D, D)
+        P_obj_concepts = torch.stack(P_obj_concepts)   # (num_concepts, D, D)
         
-        # Extract projectors for the 4 singletons (last 4 concepts in our list)
-        P_attr_singletons = P_attr_concepts[-4:] # (4, D, D)
-        P_obj_singletons = P_obj_concepts[-4:]   # (4, D, D)
+        # Extract projectors for the singletons (last `num_singletons` concepts)
+        P_attr_singletons = P_attr_concepts[-num_singletons:] # (num_singletons, D, D)
+        P_obj_singletons = P_obj_concepts[-num_singletons:]   # (num_singletons, D, D)
         
-        # 4. Compute Inclusion Matrices (4 rows x 9 cols)
-        obj_inclusion = np.zeros((4, 9))
-        attr_inclusion = np.zeros((4, 9))
+        # 4. Compute Inclusion Matrices
+        obj_inclusion = np.zeros((num_singletons, num_concepts))
+        attr_inclusion = np.zeros((num_singletons, num_concepts))
         
-        for i in range(4):
-            for j in range(9):
+        for i in range(num_singletons):
+            for j in range(num_concepts):
                 # Object: Is singleton 'i' included in concept 'j'?
                 inc_obj = get_inclusion(P_obj_singletons[i].unsqueeze(0), P_obj_concepts[j].unsqueeze(0))
                 obj_inclusion[i, j] = inc_obj.item()
@@ -437,17 +534,20 @@ class SubspaceConceptLattice(L.LightningModule):
                 attr_inclusion[i, j] = inc_attr.item()
 
         # 5. Plotting
-        fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+        # Make figure wider based on number of concepts
+        fig, axes = plt.subplots(2, 1, figsize=(max(12, num_concepts * 0.8), max(10, num_singletons * 1.5)))
         
         sns.heatmap(obj_inclusion, annot=True, cmap="Blues", vmin=0, vmax=1, 
                     xticklabels=concept_labels, yticklabels=singleton_labels, ax=axes[0])
-        axes[0].set_title("Object Subspace Inclusion: $P(S_{singleton}^{obj} \subseteq S_{concept}^{obj})$\n(Expect ~1 for valid combinations)")
+        axes[0].set_title("Object Subspace Inclusion: $P(S_{singleton}^{obj} \subseteq S_{concept}^{obj})$\\n(Expect ~1 for valid combinations)")
         axes[0].tick_params(axis='y', labelrotation=0)
+        axes[0].tick_params(axis='x', labelrotation=45)
         
         sns.heatmap(attr_inclusion, annot=True, cmap="Oranges", vmin=0, vmax=1, 
                     xticklabels=concept_labels, yticklabels=singleton_labels, ax=axes[1])
-        axes[1].set_title("Attribute Subspace Inclusion: $P(S_{concept}^{attr} \subseteq S_{singleton}^{attr})$\n(Galois Reverse: Expect ~1 for valid combinations)")
+        axes[1].set_title("Attribute Subspace Inclusion: $P(S_{concept}^{attr} \subseteq S_{singleton}^{attr})$\\n(Galois Reverse: Expect ~1 for valid combinations)")
         axes[1].tick_params(axis='y', labelrotation=0)
+        axes[1].tick_params(axis='x', labelrotation=45)
         
         plt.tight_layout()
 

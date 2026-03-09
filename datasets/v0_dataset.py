@@ -17,7 +17,8 @@ class v0Dataset(Dataset):
         self.colors = config["colors"]
         self.center_range = config["center_range"]
         self.size_range = config["size_range"]
-        self.color_map = {"red": (255, 0, 0), "blue": (0, 0, 255)}
+        self.color_map = {"red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255)}
+        self.excluded_combinations = config.get("excluded_combinations", [])
 
         self.num_samples = config["num_samples"]
 
@@ -43,8 +44,13 @@ class v0Dataset(Dataset):
         image = np.zeros([self.image_size[0], self.image_size[1], 3], dtype=np.uint8)
         mask = np.zeros(self.image_size, dtype=np.uint8)
 
-        shape = random.choice(self.shapes)
-        color = self.color_map[random.choice(self.colors)]
+        while True:
+            shape = random.choice(self.shapes)
+            color_name = random.choice(self.colors)
+            if f"{color_name} {shape}" not in self.excluded_combinations:
+                break
+        
+        color = self.color_map[color_name]
 
         if shape == "circle":
             radius = np.random.randint(self.size_range[0], self.size_range[1]) // 2
