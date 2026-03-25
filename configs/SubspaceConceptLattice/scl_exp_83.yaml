@@ -1,0 +1,96 @@
+model:
+  type: SubspaceConceptLattice
+  config:
+    embed_dim: 128
+    ambient_dim: 8
+    n_obj: 4
+    n_attr: 2
+    image_size: 64
+    image_channels: 3
+    lbd: 0.05
+    max_combinations_per_cardinality: 10
+    intersection_power_steps: 5
+    intersection_consistency_only_pairs: false
+    attr_orthogonality_avg_first: false
+    attr_force_orthogonal_basis: true
+    global_galois_loss_start_epoch: 0
+    subspace_gumbel_sigmoid: false
+    binary_intersection: false
+    binary_inclusion: false
+    basis_orthogonality_loss_type:
+    - rank
+    basis_orthogonality_rank_target: 2.0
+    perceptual_encoder:
+      type: ViTEncoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    concept_encoder:
+      type: ConceptEncoder
+      config:
+        mapping_type: mlp
+        heads: 8
+        clamp_X: false
+    decoder:
+      type: ViTDecoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    loss_weights:
+      reconstruction_loss: 1.0
+      singleton_obj_rank_loss: 1.0
+      max_singleton_attr_rank_loss: 10.0
+      modular_subspace_loss: 0.0
+      attr_orthogonality_loss: 0.0
+      attr_polarization_loss: 0.0
+      concept_similarity_loss: 0.0
+      union_consistency_loss: 1.0
+      intersection_consistency_loss: 10.0
+      attr_sink_loss: 10.0
+      galois_attr_loss: 10.0
+      galois_obj_loss: 1.0
+      global_galois_loss: 0.0
+      basis_orthogonality_loss: 1.0
+      basis_sparsity_loss: 0.0
+      loss_obj_card_prop: 1.0
+      loss_attr_card_inv_prop: 1.0
+      loss_attr_obj_inv_prop: 1.0
+      repulsion_loss_obj: 1.0
+      repulsion_loss_attr: 0.0
+      residual_orthogonality_loss: 0.0
+      rank_conservation_loss: 0.0
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size:
+      - 64
+      - 64
+      shapes:
+      - circle
+      - square
+      colors:
+      - red
+      - blue
+      excluded_combinations: []
+      num_samples: 1000
+      return_metadata: true
+      center_range:
+      - 32
+      - 33
+      size_range:
+      - 20
+      - 21
+    dataloader_config:
+      batch_size: 8
+      shuffle: true
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

@@ -1,1 +1,2 @@
 from .SubspaceConceptLattice import SubspaceConceptLattice
+from .VQSubspaceConceptLattice import MemorySubspaceConceptLattice

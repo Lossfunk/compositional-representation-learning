@@ -60,7 +60,7 @@ class ViTDecoder(nn.Module):
 
 class VQDecoder(nn.Module):
     def __init__(self, config):
-        super.__init__()
+        super().__init__()
         self.config = config
 
         self.image_size = config["image_size"]
@@ -75,7 +75,7 @@ class VQDecoder(nn.Module):
 
         self.spatial_queries = nn.Parameter(torch.randn(1, self.num_patches, self.attr_ambient_dim))
 
-        self.query_proj = nn.Linear(self.ambient_dim, self.embed_dim, bias=False)
+        self.query_proj = nn.Linear(self.attr_ambient_dim, self.embed_dim, bias=False)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.embed_dim,

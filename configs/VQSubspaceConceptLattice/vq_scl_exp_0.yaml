@@ -1,0 +1,60 @@
+model:
+  type: "VQSubspaceConceptLattice"
+  config:
+    embed_dim: 128
+    attr_ambient_dim: 4
+    obj_ambient_dim: 4
+    attr_structure: [2, 2]
+    n_obj: 4
+    image_size: 64
+    image_channels: 3
+    lbd: 0.05
+    num_pairwise_iter: 1
+    loss_weights:
+      reconstruction_loss: 1.0
+      attr_intersection_loss: 1.0
+      obj_union_loss: 1.0
+      obj_closure_loss: 1.0
+      attr_commitment_loss: 1.0
+    perceptual_encoder:
+      type: "ViTEncoder"
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    concept_encoder:
+      type: "VQConceptEncoder"
+      config:
+        mapping_type: "linear"
+        heads: 8
+    decoder:
+      type: "VQDecoder"
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size: [64, 64]
+      shapes: ["circle", "square"]
+      colors: ["red", "blue"]
+      excluded_combinations: []
+      num_samples: 1000
+      return_metadata: True
+      center_range: [32, 33]
+      size_range: [20, 21]
+    dataloader_config:
+      batch_size: 8
+      shuffle: True
+
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001
