@@ -1,0 +1,126 @@
+# obj_exp_16: exp_15 + memory stabilization
+# Adds: memory_lr_factor=0.1 (slow memory), commitment asymmetry (codebook=0.25, encoder=1.0),
+# utilization_loss_obj=10.0 to counterbalance sharpness collapse.
+model:
+  type: MemorySubspaceConceptLattice
+  config:
+    embed_dim: 128
+    ambient_dim: 8
+    n_attr: 2
+    n_obj: 4
+    image_size: 64
+    image_channels: 3
+    lbd: 0.05
+    fillers_per_slot:
+    - 2
+    - 2
+    max_cardinality: 8
+    max_combinations_per_cardinality: 5
+    resolution_method: gumbel_softmax
+    resolution_tau: 0.1
+    utilization_mode: soft
+    utilization_tau: 0.1
+    obj_rank_loss_mode: svd
+    memory_lr_factor: 0.1
+    commitment_codebook_weight: 0.1
+    commitment_encoder_weight: 1.0
+    # Use new unified attention (separate obj decoder like exp_14)
+    separate_obj_attr_attn: true
+    separate_slot_attn: false
+    attn_depth: 4
+    attn_heads: 8
+    attn_mlp_ratio: 4.0
+    perceptual_encoder:
+      type: ViTEncoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    concept_encoder:
+      config:
+        heads: 8
+    decoder:
+      type: ViTDecoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    loss_weights:
+      # Reconstruction — drives perceptual encoder diversity
+      reconstruction_loss: 0.0
+      # Memory structural
+      memory_slot_orthogonality_loss: 0.0
+      memory_obj_rank_loss: 1.0
+      memory_obj_orthogonality_loss: 1.0
+      # Commitment
+      commitment_loss: 1.0
+      # Utilization + sharpness
+      utilization_loss_obj: 1.0
+      assignment_sharpness_obj: 1.0
+      # Everything else OFF
+      max_singleton_attr_rank_loss: 0.0
+      galois_attr_loss: 0.0
+      intersection_consistency_loss: 0.0
+      attr_sink_loss: 0.0
+      loss_attr_obj_inv_prop: 0.0
+      repulsion_loss_attr: 0.0
+      repulsion_loss_obj: 0.0
+      cosine_repulsion_loss_attr: 0.0
+      cosine_repulsion_loss_obj: 0.0
+      utilization_loss_attr: 0.0
+      utilization_anti_collapse_attr: 0.0
+      utilization_anti_collapse_obj: 0.0
+      utilization_rank_conditioned_attr: 0.0
+      utilization_rank_conditioned_obj: 0.0
+      assignment_sharpness_attr: 0.0
+      galois_obj_loss: 0.0
+      union_consistency_loss: 0.0
+      proposal_norm_loss: 0.0
+    loss_targets:
+      galois_obj_loss: resolved
+      union_consistency_loss: resolved
+      repulsion_loss_obj: resolved
+      cosine_repulsion_loss_obj: resolved
+      repulsion_loss_attr: resolved
+      cosine_repulsion_loss_attr: resolved
+      galois_attr_loss: resolved
+      intersection_consistency_loss: resolved
+      attr_sink_loss: resolved
+      loss_attr_obj_inv_prop: resolved
+      max_singleton_attr_rank_loss: resolved
+      loss_obj_rank_card_prop: resolved
+      loss_attr_rank_card_inv_prop: resolved
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size:
+      - 64
+      - 64
+      shapes:
+      - circle
+      - square
+      colors:
+      - red
+      - blue
+      excluded_combinations: []
+      num_samples: 1000
+      return_metadata: true
+      center_range:
+      - 32
+      - 33
+      size_range:
+      - 20
+      - 21
+    dataloader_config:
+      batch_size: 16
+      shuffle: true
+      num_workers: 4
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

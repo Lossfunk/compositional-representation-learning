@@ -1,0 +1,114 @@
+## exp_139: Higher intersection power steps (12 instead of 5)
+## Base: exp_135 (refreshed baseline)
+## Change: intersection_power_steps: 12
+## With power=5: eigenvalue 0.5 maps to 0.5^5 = 0.031 (soft intersection)
+## With power=12: eigenvalue 0.5 maps to 0.5^12 = 0.00024 (sharp intersection)
+## Hypothesis: Sharper intersections make IC MSE more discriminating — the
+## difference between "partially shared" and "not shared" becomes starker.
+## This should amplify the IC MSE differentiation mechanism because small
+## eigenvalue differences in the averaged projector become large differences
+## after powering. Risk: very sharp intersections create steep loss landscapes
+## that may be harder to optimize (gradient cliffs).
+model:
+  type: SubspaceConceptLattice
+  config:
+    embed_dim: 128
+    ambient_dim: 8
+    n_obj: 4
+    n_attr: 2
+    image_size: 64
+    image_channels: 3
+    lbd: 0.05
+    max_combinations_per_cardinality: 10
+    intersection_power_steps: 12
+    intersection_consistency_only_pairs: false
+    attr_orthogonality_avg_first: false
+    attr_force_orthogonal_basis: true
+    global_galois_loss_start_epoch: 0
+    subspace_gumbel_sigmoid: false
+    binary_intersection: false
+    binary_inclusion: false
+    basis_orthogonality_loss_type:
+    - rank
+    basis_orthogonality_rank_target: 2.0
+    ic_mode: "mse"
+    uc_mode: "bounds"
+    galois_cycle_weight_mode: temperature
+    galois_cycle_threshold: 0.6
+    galois_cycle_tau: 0.1
+    perceptual_encoder:
+      type: ViTEncoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    concept_encoder:
+      type: ConceptEncoder
+      config:
+        mapping_type: mlp
+        heads: 8
+        clamp_X: false
+    decoder:
+      type: ViTDecoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    loss_weights:
+      reconstruction_loss: 1.0
+      singleton_obj_rank_loss: 1.0
+      max_singleton_attr_rank_loss: 10.0
+      modular_subspace_loss: 0.0
+      attr_orthogonality_loss: 0.0
+      attr_polarization_loss: 0.0
+      concept_similarity_loss: 0.0
+      union_consistency_loss: 1.0
+      intersection_consistency_loss: 10.0
+      attr_sink_loss: 10.0
+      galois_attr_loss: 10.0
+      galois_obj_loss: 1.0
+      global_galois_loss: 0.0
+      basis_orthogonality_loss: 1.0
+      basis_sparsity_loss: 0.0
+      loss_obj_card_prop: 1.0
+      loss_attr_card_inv_prop: 10.0
+      loss_attr_obj_inv_prop: 1.0
+      repulsion_loss_obj: 1.0
+      repulsion_loss_attr: 1.0
+      residual_orthogonality_loss: 0.0
+      rank_conservation_loss: 1.0
+      rank_complementarity_loss: 0.0
+      margin_topological_sort_loss: 0.0
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size:
+      - 64
+      - 64
+      shapes:
+      - circle
+      - square
+      colors:
+      - red
+      - blue
+      excluded_combinations: []
+      num_samples: 1000
+      return_metadata: true
+      center_range:
+      - 32
+      - 33
+      size_range:
+      - 20
+      - 21
+    dataloader_config:
+      batch_size: 8
+      shuffle: true
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

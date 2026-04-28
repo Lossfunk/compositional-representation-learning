@@ -1,0 +1,121 @@
+## exp_127: Fixed orthogonality losses + cross_slot_decorrelation + attr_sink
+## Base: exp_126 (IC MSE, which enables attr rank differentiation)
+## Changes from exp_126:
+##   - basis_orthogonality_loss_type: [rank, polarize] (NOT ortho — polarize pushes |cos_sim| to {0,1})
+##   - obj_subspace_orthogonality_mode: polarize (push inclusion to {0,1}, not all to 0)
+##   - cross_slot_decorrelation_loss: 1.0 (forces slots to encode independent factors)
+##   - attr_sink_loss: 1.0 (re-enabled — drives high-cardinality attr rank reduction)
+## Goal: Fix shape capture. exp_126 gets color+shared but not color+shape because:
+##   - Old ortho loss pushes ALL concepts apart (even same-attribute ones)
+##   - No cross-slot decorrelation means both slots can encode color
+##   - No attr_sink means no explicit high-cardinality rank pressure
+model:
+  type: SubspaceConceptLattice
+  config:
+    embed_dim: 128
+    ambient_dim: 4
+    n_obj: 4
+    n_attr: 2
+    image_size: 64
+    image_channels: 3
+    lbd: 0.05
+    max_combinations_per_cardinality: 10
+    intersection_power_steps: 5
+    intersection_consistency_only_pairs: false
+    attr_orthogonality_avg_first: false
+    attr_force_orthogonal_basis: true
+    global_galois_loss_start_epoch: 0
+    subspace_gumbel_sigmoid: false
+    binary_intersection: false
+    binary_inclusion: false
+    basis_orthogonality_loss_type:
+    - rank
+    - polarize
+    - balance
+    basis_orthogonality_rank_target: 2.0
+    galois_cycle_weight_mode: temperature
+    galois_cycle_threshold: 0.6
+    galois_cycle_tau: 0.1
+    ic_mode: "mse"
+    uc_mode: "bounds"
+    attr_obj_orthogonality_direct: true
+    obj_subspace_orthogonality_mode: "polarize"
+    perceptual_encoder:
+      type: ViTEncoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    concept_encoder:
+      type: ConceptEncoder
+      config:
+        mapping_type: mlp
+        heads: 8
+        encoder_depth: 2
+        clamp_X: false
+    decoder:
+      type: ViTDecoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    loss_weights:
+      reconstruction_loss: 1.0
+      singleton_obj_rank_loss: 1.0
+      max_singleton_attr_rank_loss: 1.0
+      modular_subspace_loss: 0.0
+      attr_orthogonality_loss: 0.0
+      attr_polarization_loss: 0.0
+      concept_similarity_loss: 0.0
+      union_consistency_loss: 1.0
+      intersection_consistency_loss: 1.0
+      attr_sink_loss: 1.0
+      galois_attr_loss: 1.0
+      galois_obj_loss: 1.0
+      global_galois_loss: 0.0
+      basis_orthogonality_loss: 1.0
+      obj_subspace_orthogonality_loss: 1.0
+      basis_sparsity_loss: 0.0
+      loss_obj_card_prop: 0.0
+      loss_attr_card_inv_prop: 0.0
+      loss_attr_obj_inv_prop: 0.0
+      repulsion_loss_obj: 0.0
+      repulsion_loss_attr: 0.0
+      residual_orthogonality_loss: 0.0
+      rank_conservation_loss: 0.0
+      attr_obj_orthogonality_loss: 1.0
+      cross_slot_decorrelation_loss: 1.0
+      galois_cycle_loss: 0.0
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size:
+      - 64
+      - 64
+      shapes:
+      - circle
+      - square
+      colors:
+      - red
+      - blue
+      excluded_combinations: []
+      num_samples: 1000
+      return_metadata: true
+      center_range:
+      - 32
+      - 33
+      size_range:
+      - 20
+      - 21
+    dataloader_config:
+      batch_size: 8
+      shuffle: true
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

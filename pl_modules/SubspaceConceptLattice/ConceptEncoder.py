@@ -118,8 +118,16 @@ class ConceptEncoder(nn.Module):
         self.query_attr = nn.Parameter(torch.randn(self.n_attr, self.embed_dim))
         self.query_obj = nn.Parameter(torch.randn(self.n_obj, self.embed_dim))
         
-        # Shared Multi-Head Attention for pooling
-        self.attn = nn.MultiheadAttention(embed_dim=self.embed_dim, num_heads=self.heads, batch_first=True)
+        # Shared transformer for pooling
+        self.encoder_depth = config.get("encoder_depth", 1)
+        self.attn_layers = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim=self.embed_dim, num_heads=self.heads, batch_first=True)
+            for _ in range(self.encoder_depth)
+        ])
+        self.attn_norms = nn.ModuleList([
+            nn.LayerNorm(self.embed_dim)
+            for _ in range(self.encoder_depth)
+        ])
         
         # Mappings between the ambient and embeddings spaces
         if self.mapping_type == "linear":
@@ -175,8 +183,13 @@ class ConceptEncoder(nn.Module):
         # ==========================================
         # Expand queries for the batch
         q_attr = self.query_attr.unsqueeze(0).expand(B, -1, -1) # (B, n_attr, embed_dim)
-        # Attention pools the variable-length sequence H into fixed n_attr vectors
-        x_attr, _ = self.attn(query=q_attr, key=H, value=H) # (B, n_attr, embed_dim)
+        # Cross-attention stack pools the variable-length sequence H into fixed n_attr vectors
+        x_attr = q_attr
+        for attn, norm in zip(self.attn_layers, self.attn_norms):
+            residual = x_attr
+            x_attr = norm(x_attr)
+            x_attr, _ = attn(query=x_attr, key=H, value=H)
+            x_attr = x_attr + residual
         # Map to ambient dimension D to get the basis vectors X
         X_attr = self.attr_enc(x_attr) # (B, n_attr, ambient_dim)
 
@@ -203,7 +216,12 @@ class ConceptEncoder(nn.Module):
         # Pathway B: The Object Subspace (S^obj)
         # ==========================================
         q_obj = self.query_obj.unsqueeze(0).expand(B, -1, -1) # (B, n_obj, embed_dim)
-        x_obj, _ = self.attn(query=q_obj, key=H, value=H) # (B, n_obj, embed_dim)
+        x_obj = q_obj
+        for attn, norm in zip(self.attn_layers, self.attn_norms):
+            residual = x_obj
+            x_obj = norm(x_obj)
+            x_obj, _ = attn(query=x_obj, key=H, value=H)
+            x_obj = x_obj + residual
         X_obj = self.obj_enc(x_obj) # (B, n_obj, ambient_dim)
         if self.clamp_X:
             X_obj = torch.clamp(X_obj, min=0, max=1)
@@ -247,7 +265,18 @@ class MemoryConceptEncoder(nn.Module):
         self.lbd = config["lbd"]
         self.heads = config["heads"]
         self.fillers_per_slot = config["fillers_per_slot"]  # e.g. [2, 2]
-        self.resolution_method = config.get("resolution_method", "cosine")
+
+        # Resolution method: "argmax" (hard argmax + STE) or "gumbel_softmax"
+        self.resolution_method = config.get("resolution_method", "argmax")
+        self.resolution_tau = config.get("resolution_tau", 1.0)
+
+        # Commitment loss asymmetry: weight for codebook vs encoder terms.
+        # codebook_weight controls how fast memory moves toward proposals.
+        # encoder_weight controls how fast proposals move toward memory.
+        # Default: both 1.0 (symmetric, original VQ-VAE).
+        # For stable memory: lower codebook_weight (e.g., 0.25).
+        self.commitment_codebook_weight = config.get("commitment_codebook_weight", 1.0)
+        self.commitment_encoder_weight = config.get("commitment_encoder_weight", 1.0)
 
         # Per-slot dimension allocation
         if config.get("dims_per_slot") is not None:
@@ -268,16 +297,67 @@ class MemoryConceptEncoder(nn.Module):
         ])
 
         # ── Object Memory ──────────────────────────────────────────────
-        # n_obj vectors in full ambient_dim, each representing one object.
-        self.obj_memory = nn.Parameter(torch.randn(self.n_obj, self.ambient_dim) * 0.1)
+        # n_obj subspaces, each defined by n_obj basis vectors in ambient_dim.
+        # Target: each entry is rank-1 (all rows identical), entries are
+        # mutually orthogonal. Pick n_obj orthonormal directions, assign
+        # one per entry, and tile it across all n_obj rows.
+        Q, _ = torch.linalg.qr(torch.randn(self.ambient_dim, self.n_obj))
+        directions = Q.t()  # (n_obj, ambient_dim), orthonormal rows
+        obj_mem_init = directions.unsqueeze(1).expand(
+            self.n_obj, self.n_obj, self.ambient_dim
+        ).clone()  # (n_obj, n_obj, ambient_dim) — each entry has identical rows
+        self.obj_memory = nn.Parameter(obj_mem_init)
 
         # ── Proposal Network ───────────────────────────────────────────
-        # Shared attention pooling (same as ConceptEncoder)
+        # Attention hierarchy (each level requires the previous):
+        #   Level 0: shared TransformerDecoder for attr+obj queries (simplest)
+        #   Level 1: separate_obj_attr_attn — separate decoders for attr vs obj
+        #   Level 2: separate_slot_attn — separate decoders per attr slot
+        self.separate_obj_attr_attn = config.get("separate_obj_attr_attn", False)
+        self.separate_slot_attn = config.get("separate_slot_attn", False)
+        if self.separate_slot_attn:
+            assert self.separate_obj_attr_attn, \
+                "separate_slot_attn requires separate_obj_attr_attn=True"
+
+        attn_depth = config.get("attn_depth", 1)
+        attn_heads = config.get("attn_heads", self.heads)
+        attn_mlp_ratio = config.get("attn_mlp_ratio", 4.0)
+
+        def _make_decoder(n_layers):
+            layer = nn.TransformerDecoderLayer(
+                d_model=self.embed_dim,
+                nhead=attn_heads,
+                dim_feedforward=int(self.embed_dim * attn_mlp_ratio),
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            return nn.TransformerDecoder(layer, num_layers=n_layers)
+
+        # Learnable queries
         self.query_attr = nn.Parameter(torch.randn(self.n_attr, self.embed_dim))
         self.query_obj = nn.Parameter(torch.randn(self.n_obj, self.embed_dim))
-        self.attn = nn.MultiheadAttention(
-            embed_dim=self.embed_dim, num_heads=self.heads, batch_first=True
-        )
+
+        if not self.separate_obj_attr_attn:
+            # Level 0: single shared decoder, attr+obj queries concatenated
+            self.shared_decoder = _make_decoder(attn_depth)
+            self.shared_decoder_norm = nn.LayerNorm(self.embed_dim)
+        elif not self.separate_slot_attn:
+            # Level 1: separate decoders for attr vs obj
+            self.attr_decoder = _make_decoder(attn_depth)
+            self.attr_decoder_norm = nn.LayerNorm(self.embed_dim)
+            self.obj_decoder = _make_decoder(attn_depth)
+            self.obj_decoder_norm = nn.LayerNorm(self.embed_dim)
+        else:
+            # Level 2: per-slot decoders for attr + separate obj decoder
+            self.slot_decoders = nn.ModuleList([
+                _make_decoder(attn_depth) for _ in range(self.n_attr)
+            ])
+            self.slot_decoder_norms = nn.ModuleList([
+                nn.LayerNorm(self.embed_dim) for _ in range(self.n_attr)
+            ])
+            self.obj_decoder = _make_decoder(attn_depth)
+            self.obj_decoder_norm = nn.LayerNorm(self.embed_dim)
 
         # Per-slot projection: embed_dim → slot's ambient dims
         self.slot_projectors = nn.ModuleList([
@@ -319,24 +399,33 @@ class MemoryConceptEncoder(nn.Module):
         Per slot: index 0 = zero vector, indices 1..K = memory fillers.
         So slot with K fillers has K+1 options.
         Total candidates = product of (K_i + 1) for all slots.
+        Also precomputes hardcoded ranks (= number of non-zero slots).
         """
         import itertools as _it
         options_per_slot = [range(k + 1) for k in self.fillers_per_slot]
         self._attr_candidate_tuples = list(_it.product(*options_per_slot))
         self.n_attr_candidates = len(self._attr_candidate_tuples)
+        # Rank = number of active (non-zero) slots
+        self._attr_candidate_ranks = [
+            sum(1 for c in combo if c != 0)
+            for combo in self._attr_candidate_tuples
+        ]
 
     def _build_obj_candidates_index(self):
         """
         Build all non-empty subsets of object memory indices.
         For n_obj objects: 2^n_obj - 1 candidates.
         Each candidate is a tuple of object indices to union.
+        Also precomputes hardcoded ranks (= number of entries in subset).
         """
+        import itertools as _it
         self._obj_candidate_subsets = []
         for r in range(1, self.n_obj + 1):
-            import itertools as _it
             for subset in _it.combinations(range(self.n_obj), r):
                 self._obj_candidate_subsets.append(subset)
         self.n_obj_candidates = len(self._obj_candidate_subsets)
+        # Rank = number of base subspaces in the union
+        self._obj_candidate_ranks = [len(s) for s in self._obj_candidate_subsets]
 
     def _build_singleton_candidates_index(self):
         """
@@ -351,9 +440,13 @@ class MemoryConceptEncoder(nn.Module):
         options_per_slot = [range(1, k + 1) for k in self.fillers_per_slot]
         self._singleton_attr_candidate_tuples = list(_it.product(*options_per_slot))
         self.n_singleton_attr_candidates = len(self._singleton_attr_candidate_tuples)
+        # All singleton attr candidates have all slots active
+        self._singleton_attr_candidate_ranks = [self.n_attr] * self.n_singleton_attr_candidates
 
         self._singleton_obj_candidate_subsets = [(i,) for i in range(self.n_obj)]
         self.n_singleton_obj_candidates = self.n_obj
+        # All singleton obj candidates have rank 1
+        self._singleton_obj_candidate_ranks = [1] * self.n_singleton_obj_candidates
 
     # ------------------------------------------------------------------ #
     #  Build candidate vectors/projectors from memory (called at forward)
@@ -375,8 +468,9 @@ class MemoryConceptEncoder(nn.Module):
                     # Zero vector (absent filler)
                     vec = torch.zeros(self.ambient_dim, device=device)
                 else:
-                    # Memory filler (1-indexed → 0-indexed)
+                    # Memory filler (1-indexed → 0-indexed), L2-normalized
                     slot_vec = self.attr_memory[slot_idx][choice - 1]  # (d,)
+                    slot_vec = F.normalize(slot_vec, p=2, dim=-1)
                     vec = F.pad(slot_vec, (offset_before, offset_after))
                 basis_vecs.append(vec)
             candidates.append(torch.stack(basis_vecs))  # (n_attr, ambient_dim)
@@ -395,8 +489,9 @@ class MemoryConceptEncoder(nn.Module):
                 d = self.dims_per_slot[slot_idx]
                 offset_before = sum(self.dims_per_slot[:slot_idx])
                 offset_after = self.ambient_dim - offset_before - d
-                # choice is 1-indexed (1..K) — no zero option
+                # choice is 1-indexed (1..K) — no zero option, L2-normalized
                 slot_vec = self.attr_memory[slot_idx][choice - 1]  # (d,)
+                slot_vec = F.normalize(slot_vec, p=2, dim=-1)
                 vec = F.pad(slot_vec, (offset_before, offset_after))
                 basis_vecs.append(vec)
             candidates.append(torch.stack(basis_vecs))  # (n_attr, ambient_dim)
@@ -404,123 +499,208 @@ class MemoryConceptEncoder(nn.Module):
 
     def _get_singleton_obj_candidate_projectors(self):
         """
-        Build projectors for individual object memory entries (no unions).
+        Build projectors for individual object memory subspaces (no unions).
+        Each entry is already (n_obj, ambient_dim).
         Returns:
             candidates_P: (n_obj, ambient_dim, ambient_dim)
-            candidates_X: (n_obj, n_obj, ambient_dim) — padded
         """
         candidates_P = []
-        candidates_X = []
         for subset in self._singleton_obj_candidate_subsets:
-            X = self.obj_memory[list(subset)]  # (1, ambient_dim)
+            X = self.obj_memory[subset[0]]  # (n_obj, ambient_dim)
             P = ridge_projector(X.unsqueeze(0), lbd=self.lbd).squeeze(0)
             candidates_P.append(P)
-            padded = torch.zeros(self.n_obj, self.ambient_dim, device=self.obj_memory.device)
-            padded[:len(subset)] = X
-            candidates_X.append(padded)
-        return torch.stack(candidates_P), torch.stack(candidates_X)
+        return torch.stack(candidates_P)  # (n_obj, D, D)
 
     def _get_obj_candidate_projectors(self):
         """
         Build (n_obj_candidates, ambient_dim, ambient_dim) tensor of union
-        projectors for each non-empty subset of object memory.
-        Also returns the basis vectors for each candidate.
+        projectors for each non-empty subset of object memory subspaces.
+
+        Each obj_memory entry is (n_obj, ambient_dim). For a subset of entries,
+        we concatenate their basis vectors and compute the ridge projector over
+        the union.
         """
         candidates_P = []
-        candidates_X = []
         for subset in self._obj_candidate_subsets:
-            X = self.obj_memory[list(subset)]  # (|subset|, ambient_dim)
+            # Concatenate basis vectors from selected entries
+            parts = [self.obj_memory[i] for i in subset]  # each (n_obj, D)
+            X = torch.cat(parts, dim=0)  # (|subset|*n_obj, ambient_dim)
             P = ridge_projector(X.unsqueeze(0), lbd=self.lbd).squeeze(0)
             candidates_P.append(P)
-            # Pad X to n_obj dims for consistent shape
-            padded = torch.zeros(self.n_obj, self.ambient_dim, device=self.obj_memory.device)
-            padded[:len(subset)] = X
-            candidates_X.append(padded)
-        return torch.stack(candidates_P), torch.stack(candidates_X)
+        return torch.stack(candidates_P)  # (n_obj_candidates, D, D)
 
     # ------------------------------------------------------------------ #
-    #  Distance / similarity scoring
+    #  Inclusion helpers
     # ------------------------------------------------------------------ #
-    def _cosine_score_attr(self, proposal_X_attr, candidate_X_attr):
+    def _bidirectional_inclusion(self, P_a, P_b):
         """
-        Score each candidate by average cosine similarity across attr slots.
+        Compute bidirectional inclusion product between two sets of projectors.
+        incl(A⊆B) * incl(B⊆A) for each (a, b) pair.
 
         Args:
-            proposal_X_attr:   (B, n_attr, ambient_dim)
-            candidate_X_attr:  (C, n_attr, ambient_dim)
+            P_a: (N, D, D)
+            P_b: (M, D, D)
         Returns:
-            scores: (B, C)
+            scores: (N, M)
         """
-        # Flatten to (B, n_attr*ambient_dim) and (C, n_attr*ambient_dim)
-        B = proposal_X_attr.shape[0]
-        C = candidate_X_attr.shape[0]
-        p_flat = proposal_X_attr.reshape(B, -1)
-        c_flat = candidate_X_attr.reshape(C, -1)
-        p_norm = F.normalize(p_flat, dim=-1)
-        c_norm = F.normalize(c_flat, dim=-1)
-        return p_norm @ c_norm.t()  # (B, C)
+        N, D, _ = P_a.shape
+        M = P_b.shape[0]
+        a_flat = P_a.reshape(N, D * D)
+        b_flat = P_b.reshape(M, D * D)
+        overlap = a_flat @ b_flat.t()  # (N, M) — Tr(P_a @ P_b)
+        tr_a = torch.einsum("nii->n", P_a).clamp(min=1e-6)  # (N,)
+        tr_b = torch.einsum("mii->m", P_b).clamp(min=1e-6)  # (M,)
+        incl_a_in_b = overlap / tr_a.unsqueeze(1)  # (N, M)
+        incl_b_in_a = overlap / tr_b.unsqueeze(0)  # (N, M)
+        return incl_a_in_b * incl_b_in_a  # (N, M)
 
-    def _inclusion_score_attr(self, proposal_P_attr, candidate_X_attr):
+    # ------------------------------------------------------------------ #
+    #  Resolution methods
+    # ------------------------------------------------------------------ #
+    def _resolve_attr(self, raw_X_attr, raw_P_attr, singleton=False):
         """
-        For each candidate, compute inclusion of candidate's attr subspace
-        within the proposal's attr subspace.
+        Resolve attr proposal against memory candidates.
+
+        Supports two selection methods (configured via self.resolution_method):
+          "argmax"         — hard argmax + STE (default)
+          "gumbel_softmax" — Gumbel-Softmax weighted combination of candidates
 
         Args:
-            proposal_P_attr:  (B, ambient_dim, ambient_dim) — proposal projector
-            candidate_X_attr: (C, n_attr, ambient_dim) — candidate basis vectors
+            raw_X_attr: (B, n_attr, ambient_dim) — proposal basis vectors
+            raw_P_attr: (B, D, D) — proposal projector
+            singleton:  if True, use reduced candidates (no zeros)
+
         Returns:
-            scores: (B, C)
+            resolved_X_attr: (B, n_attr, ambient_dim) — resolved basis
+            resolved_P_attr: (B, D, D) — projector of resolved basis
+            attr_hard_idx:   (B,) — index of selected candidate (argmax of scores/weights)
+            commitment_loss: scalar
+            scores:          (B, C) — raw bidirectional inclusion scores
         """
-        C = candidate_X_attr.shape[0]
+        B = raw_X_attr.shape[0]
+
+        if singleton:
+            cand_X = self._get_singleton_attr_candidate_vectors()
+            n_cand = self.n_singleton_attr_candidates
+        else:
+            cand_X = self._get_attr_candidate_vectors()
+            n_cand = self.n_attr_candidates
+
         # Build candidate projectors
-        cand_P = ridge_projector(candidate_X_attr, lbd=self.lbd)  # (C, D, D)
+        cand_P = ridge_projector(cand_X, lbd=self.lbd)  # (C, D, D)
 
-        # Inclusion(cand ⊆ proposal) = Tr(P_cand @ P_proposal) / Tr(P_cand)
-        # Vectorize: P_flat (B, D*D) @ cand_P_flat.T (D*D, C)
-        B, D, _ = proposal_P_attr.shape
-        p_flat = proposal_P_attr.reshape(B, D * D)
-        c_flat = cand_P.reshape(C, D * D)
-        overlap = p_flat @ c_flat.t()  # (B, C)
-        tr_cand = torch.einsum("cii->c", cand_P).clamp(min=1e-6)  # (C,)
-        return overlap / tr_cand.unsqueeze(0)  # (B, C)
+        # Bidirectional inclusion: incl(prop⊆cand) * incl(cand⊆prop)
+        scores = self._bidirectional_inclusion(raw_P_attr, cand_P)  # (B, C)
 
-    def _inclusion_score_obj(self, proposal_P_obj, candidate_P_obj):
+        if self.resolution_method == "gumbel_softmax":
+            # Gumbel-Softmax: differentiable soft selection
+            # Use (scores + eps).log() instead of scores.log().clamp() to avoid
+            # gradient explosion: d/dx log(x) = 1/x is huge when x ≈ 0, and
+            # clamp doesn't fix the backward gradient in the un-clamped region.
+            logits = (scores + 1e-8).log()
+            weights = F.gumbel_softmax(
+                logits,
+                tau=self.resolution_tau, hard=True,
+            )  # (B, C) — one-hot in forward, soft in backward
+            # Weighted combination of candidate basis vectors
+            # weights: (B, C), cand_X: (C, n_attr, D)
+            resolved_X_attr = torch.einsum("bc,cnd->bnd", weights, cand_X)
+            attr_hard_idx = weights.argmax(dim=-1)  # (B,)
+        else:
+            # Argmax + STE (original behavior)
+            with torch.no_grad():
+                attr_hard_idx = scores.argmax(dim=-1)  # (B,)
+            hard_X = cand_X[attr_hard_idx]  # (B, n_attr, ambient_dim)
+            resolved_X_attr = raw_X_attr + (hard_X - raw_X_attr).detach()
+
+        resolved_P_attr = ridge_projector(resolved_X_attr, lbd=self.lbd)
+
+        # Commitment loss (VQ-VAE style, both directions) on unit-norm rows.
+        # Proposals are already unit-norm; normalize memory candidates to match.
+        hard_X = cand_X[attr_hard_idx]
+        hard_X_norm = F.normalize(hard_X, p=2, dim=-1)
+        codebook_loss = F.mse_loss(raw_X_attr.detach(), hard_X_norm)
+        encoder_loss = F.mse_loss(raw_X_attr, hard_X_norm.detach())
+        commitment_loss = (self.commitment_codebook_weight * codebook_loss
+                           + self.commitment_encoder_weight * encoder_loss)
+
+        return resolved_X_attr, resolved_P_attr, attr_hard_idx, commitment_loss, scores
+
+    def _resolve_obj(self, raw_X_obj, raw_P_obj, singleton=False):
         """
-        For each obj candidate (union projector), compute inclusion of
-        proposal's obj subspace within the candidate's obj subspace.
+        Resolve obj proposal against memory candidates.
+
+        Supports two selection methods (configured via self.resolution_method):
+          "argmax"         — hard argmax + STE (default)
+          "gumbel_softmax" — Gumbel-Softmax weighted combination of candidates
 
         Args:
-            proposal_P_obj:  (B, D, D) — proposal projector
-            candidate_P_obj: (C, D, D) — candidate union projectors
-        Returns:
-            scores: (B, C)
-        """
-        B, D, _ = proposal_P_obj.shape
-        C = candidate_P_obj.shape[0]
-        # Inclusion(proposal ⊆ candidate) = Tr(P_proposal @ P_candidate) / Tr(P_proposal)
-        p_flat = proposal_P_obj.reshape(B, D * D)
-        c_flat = candidate_P_obj.reshape(C, D * D)
-        overlap = p_flat @ c_flat.t()  # (B, C)
-        tr_prop = torch.einsum("bii->b", proposal_P_obj).clamp(min=1e-6)  # (B,)
-        return overlap / tr_prop.unsqueeze(1)  # (B, C)
+            raw_X_obj: (B, n_obj, ambient_dim) — proposal basis vectors
+            raw_P_obj: (B, D, D) — proposal projector
+            singleton: if True, use base subspaces only (no unions)
 
-    def _cosine_score_obj(self, proposal_X_obj, candidate_X_obj):
-        """
-        Score each obj candidate by cosine similarity.
-
-        Args:
-            proposal_X_obj:  (B, n_obj, ambient_dim)
-            candidate_X_obj: (C, n_obj, ambient_dim)
         Returns:
-            scores: (B, C)
+            resolved_X_obj: (B, n_obj, ambient_dim) — resolved basis
+            resolved_P_obj: (B, D, D) — resolved projector
+            obj_hard_idx:   (B,) — index of selected candidate (argmax of scores/weights)
+            commitment_loss: scalar
+            scores:          (B, C) — raw bidirectional inclusion scores
         """
-        B = proposal_X_obj.shape[0]
-        C = candidate_X_obj.shape[0]
-        p_flat = proposal_X_obj.reshape(B, -1)
-        c_flat = candidate_X_obj.reshape(C, -1)
-        p_norm = F.normalize(p_flat, dim=-1)
-        c_norm = F.normalize(c_flat, dim=-1)
-        return p_norm @ c_norm.t()  # (B, C)
+        B = raw_X_obj.shape[0]
+
+        if singleton:
+            cand_P = self._get_singleton_obj_candidate_projectors()
+            n_cand = self.n_singleton_obj_candidates
+            candidate_subsets = self._singleton_obj_candidate_subsets
+        else:
+            cand_P = self._get_obj_candidate_projectors()
+            n_cand = self.n_obj_candidates
+            candidate_subsets = self._obj_candidate_subsets
+
+        # Bidirectional inclusion: incl(prop⊆cand) * incl(cand⊆prop)
+        scores = self._bidirectional_inclusion(raw_P_obj, cand_P)  # (B, C)
+
+        if self.resolution_method == "gumbel_softmax":
+            # Gumbel-Softmax: differentiable soft selection
+            # Use (scores + eps).log() to avoid gradient explosion at near-zero scores.
+            logits = (scores + 1e-8).log()
+            weights = F.gumbel_softmax(
+                logits,
+                tau=self.resolution_tau, hard=True,
+            )  # (B, C) — one-hot in forward, soft in backward
+            obj_hard_idx = weights.argmax(dim=-1)  # (B,)
+            # Weighted combination of candidate projectors
+            # weights: (B, C), cand_P: (C, D, D)
+            resolved_P_obj = torch.einsum("bc,cde->bde", weights, cand_P)
+        else:
+            # Argmax + STE (original behavior)
+            with torch.no_grad():
+                obj_hard_idx = scores.argmax(dim=-1)  # (B,)
+            hard_P = cand_P[obj_hard_idx]  # (B, D, D)
+            resolved_P_obj = raw_P_obj + (hard_P - raw_P_obj).detach()
+
+        # Resolved X_obj: from base memory subspaces for downstream use
+        base_X = self.obj_memory  # (n_obj, n_obj, ambient_dim)
+        if singleton:
+            resolved_X_obj = base_X[obj_hard_idx]  # (B, n_obj, ambient_dim)
+        else:
+            resolved_X_list = []
+            for b in range(B):
+                subset = candidate_subsets[obj_hard_idx[b].item()]
+                parts = [base_X[i] for i in subset]
+                resolved_X_list.append(torch.stack(parts).mean(dim=0))
+            resolved_X_obj = torch.stack(resolved_X_list)  # (B, n_obj, ambient_dim)
+
+        # Commitment loss (VQ-VAE style, both directions) on unit-norm rows.
+        # Proposals are already unit-norm; normalize memory candidates to match.
+        hard_X = resolved_X_obj  # (B, n_obj, ambient_dim) — from memory
+        hard_X_norm = F.normalize(hard_X, p=2, dim=-1)
+        codebook_loss = F.mse_loss(raw_X_obj.detach(), hard_X_norm)
+        encoder_loss = F.mse_loss(raw_X_obj, hard_X_norm.detach())
+        commitment_loss = (self.commitment_codebook_weight * codebook_loss
+                           + self.commitment_encoder_weight * encoder_loss)
+
+        return resolved_X_obj, resolved_P_obj, obj_hard_idx, commitment_loss, scores
 
     # ------------------------------------------------------------------ #
     #  Forward
@@ -530,21 +710,24 @@ class MemoryConceptEncoder(nn.Module):
         Args:
             R_subset: (B, S, P, E) — perceptual representations of a subset
                       of S images, each with P patches of dim E.
-            tau:  Gumbel-Softmax temperature.
-            hard: hard assignment (straight-through).
+            tau:      unused (kept for API compatibility)
+            hard:     unused (always hard argmax + STE)
             singleton: if True, use reduced candidate sets (no zeros for attr,
-                       no unions for obj). Should be used for singleton concepts.
+                       no unions for obj).
 
-        Returns:
-            X_attr:           (B, n_attr, ambient_dim) — resolved attr basis
-            X_obj:            (B, n_obj, ambient_dim) — resolved obj basis
-            P_attr:           (B, D, D) — resolved attr projector
-            P_obj:            (B, D, D) — resolved obj projector
-            attr_assign_idx:  (B,) — index into attr candidates
-            obj_assign_idx:   (B,) — index into obj candidates
-            attr_log_probs:   (B,) — log-prob of chosen attr candidate
-            obj_log_probs:    (B,) — log-prob of chosen obj candidate
-            commitment_loss:  scalar
+        Returns: dict with keys:
+            resolved_X_attr:    (B, n_attr, ambient_dim) — resolved attr basis
+            resolved_X_obj:     (B, n_obj, ambient_dim) — resolved obj basis
+            resolved_P_attr:    (B, D, D) — resolved attr projector
+            resolved_P_obj:     (B, D, D) — resolved obj projector
+            proposal_X_attr:    (B, n_attr, ambient_dim) — raw proposal attr basis
+            proposal_X_obj:     (B, n_obj, ambient_dim) — raw proposal obj basis
+            proposal_P_attr:    (B, D, D) — raw proposal attr projector
+            proposal_P_obj:     (B, D, D) — raw proposal obj projector
+            attr_assign_idx:    (B,) — index into attr candidates
+            obj_assign_idx:     (B,) — index into obj candidates
+            commitment_loss:    scalar
+            proposal_norm_loss: scalar — L2 regularization on raw proposals
         """
         B, S, P, E = R_subset.shape
 
@@ -553,96 +736,89 @@ class MemoryConceptEncoder(nn.Module):
 
         # ─ 2. Proposal: attend to patches, project to ambient space ─────
         q_attr = self.query_attr.unsqueeze(0).expand(B, -1, -1)  # (B, n_attr, E)
-        x_attr_embed, _ = self.attn(query=q_attr, key=H, value=H)  # (B, n_attr, E)
+        q_obj = self.query_obj.unsqueeze(0).expand(B, -1, -1)    # (B, n_obj, E)
 
-        q_obj = self.query_obj.unsqueeze(0).expand(B, -1, -1)  # (B, n_obj, E)
-        x_obj_embed, _ = self.attn(query=q_obj, key=H, value=H)  # (B, n_obj, E)
+        if not self.separate_obj_attr_attn:
+            # Level 0: shared decoder, concatenate attr+obj queries
+            q_all = torch.cat([q_attr, q_obj], dim=1)  # (B, n_attr+n_obj, E)
+            out = self.shared_decoder_norm(
+                self.shared_decoder(tgt=q_all, memory=H)
+            )
+            x_attr_embed = out[:, :self.n_attr]  # (B, n_attr, E)
+            x_obj_embed = out[:, self.n_attr:]   # (B, n_obj, E)
+            x_attr_embeds = [x_attr_embed[:, i] for i in range(self.n_attr)]
+        elif not self.separate_slot_attn:
+            # Level 1: separate decoders for attr vs obj
+            x_attr_embed = self.attr_decoder_norm(
+                self.attr_decoder(tgt=q_attr, memory=H)
+            )
+            x_obj_embed = self.obj_decoder_norm(
+                self.obj_decoder(tgt=q_obj, memory=H)
+            )
+            x_attr_embeds = [x_attr_embed[:, i] for i in range(self.n_attr)]
+        else:
+            # Level 2: per-slot decoders for attr + separate obj decoder
+            x_attr_embeds = []
+            for slot_idx in range(self.n_attr):
+                q_slot = q_attr[:, slot_idx:slot_idx+1]  # (B, 1, E)
+                x_slot = self.slot_decoder_norms[slot_idx](
+                    self.slot_decoders[slot_idx](tgt=q_slot, memory=H)
+                )  # (B, 1, E)
+                x_attr_embeds.append(x_slot.squeeze(1))  # (B, E)
+            x_obj_embed = self.obj_decoder_norm(
+                self.obj_decoder(tgt=q_obj, memory=H)
+            )
 
-        # Project to ambient space — raw proposals (pre-resolution)
         raw_X_attr_parts = []
         for slot_idx in range(self.n_attr):
             d = self.dims_per_slot[slot_idx]
             offset_before = sum(self.dims_per_slot[:slot_idx])
             offset_after = self.ambient_dim - offset_before - d
             slot_proposal = self.slot_projectors[slot_idx](
-                x_attr_embed[:, slot_idx]
-            )  # (B, d)
+                x_attr_embeds[slot_idx]
+            )
             raw_X_attr_parts.append(
                 F.pad(slot_proposal, (offset_before, offset_after))
-            )  # (B, ambient_dim)
+            )
         raw_X_attr = torch.stack(raw_X_attr_parts, dim=1)  # (B, n_attr, ambient_dim)
-        raw_P_attr = ridge_projector(raw_X_attr, lbd=self.lbd)  # (B, D, D)
+        raw_X_attr = F.normalize(raw_X_attr, p=2, dim=-1)  # unit-norm rows
+        raw_P_attr = ridge_projector(raw_X_attr, lbd=self.lbd)
 
         raw_X_obj = self.obj_projector(x_obj_embed)  # (B, n_obj, ambient_dim)
-        raw_P_obj = ridge_projector(raw_X_obj, lbd=self.lbd)  # (B, D, D)
+        raw_X_obj = F.normalize(raw_X_obj, p=2, dim=-1)  # unit-norm rows
+        raw_P_obj = ridge_projector(raw_X_obj, lbd=self.lbd)
 
-        # ─ 3. Resolve attr against memory candidates ────────────────────
-        if singleton:
-            cand_X_attr = self._get_singleton_attr_candidate_vectors()
-            n_cand_attr = self.n_singleton_attr_candidates
-        else:
-            cand_X_attr = self._get_attr_candidate_vectors()
-            n_cand_attr = self.n_attr_candidates
+        # ─ 3. Resolve against memory ────────────────────────────────────
+        resolved_X_attr, resolved_P_attr, attr_hard_idx, attr_commit, attr_scores = \
+            self._resolve_attr(raw_X_attr, raw_P_attr, singleton=singleton)
 
-        if self.resolution_method == "cosine":
-            attr_logits = self._cosine_score_attr(raw_X_attr, cand_X_attr)
-        else:
-            attr_logits = self._inclusion_score_attr(raw_P_attr, cand_X_attr)
+        resolved_X_obj, resolved_P_obj, obj_hard_idx, obj_commit, obj_scores = \
+            self._resolve_obj(raw_X_obj, raw_P_obj, singleton=singleton)
 
-        attr_soft = F.gumbel_softmax(attr_logits, tau=tau, hard=hard, dim=-1)  # (B, C_attr)
-        # Resolved X_attr = weighted combination of candidates
-        cand_X_attr_flat = cand_X_attr.reshape(n_cand_attr, -1)
-        resolved_X_attr = (attr_soft @ cand_X_attr_flat).reshape(
-            B, self.n_attr, self.ambient_dim
-        )
-        resolved_P_attr = ridge_projector(resolved_X_attr, lbd=self.lbd)
+        commitment_loss = (attr_commit + obj_commit) / 2.0
 
-        attr_hard_idx = attr_logits.argmax(dim=-1)  # (B,)
-        attr_log_probs = F.log_softmax(attr_logits, dim=-1).gather(
-            1, attr_hard_idx.unsqueeze(1)
-        ).squeeze(1)
+        # Proposal norm penalty: mean squared row-norm of raw proposals.
+        # Regularizes proposal scale to prevent unconstrained growth.
+        attr_row_norms = raw_X_attr.norm(p=2, dim=-1)  # (B, n_attr)
+        obj_row_norms = raw_X_obj.norm(p=2, dim=-1)    # (B, n_obj)
+        proposal_norm_loss = (attr_row_norms.pow(2).mean() + obj_row_norms.pow(2).mean()) / 2.0
 
-        # ─ 4. Resolve obj against memory candidates ─────────────────────
-        if singleton:
-            cand_P_obj, cand_X_obj = self._get_singleton_obj_candidate_projectors()
-            n_cand_obj = self.n_singleton_obj_candidates
-        else:
-            cand_P_obj, cand_X_obj = self._get_obj_candidate_projectors()
-            n_cand_obj = self.n_obj_candidates
-
-        if self.resolution_method == "cosine":
-            obj_logits = self._cosine_score_obj(raw_X_obj, cand_X_obj)
-        else:
-            obj_logits = self._inclusion_score_obj(raw_P_obj, cand_P_obj)
-
-        obj_soft = F.gumbel_softmax(obj_logits, tau=tau, hard=hard, dim=-1)  # (B, C_obj)
-        # Resolved X_obj = weighted combination of candidate basis sets
-        cand_X_obj_flat = cand_X_obj.reshape(n_cand_obj, -1)
-        resolved_X_obj = (obj_soft @ cand_X_obj_flat).reshape(
-            B, self.n_obj, self.ambient_dim
-        )
-        resolved_P_obj = ridge_projector(resolved_X_obj, lbd=self.lbd)
-
-        obj_hard_idx = obj_logits.argmax(dim=-1)  # (B,)
-        obj_log_probs = F.log_softmax(obj_logits, dim=-1).gather(
-            1, obj_hard_idx.unsqueeze(1)
-        ).squeeze(1)
-
-        # ─ 5. Commitment loss ───────────────────────────────────────────
-        attr_target = F.one_hot(attr_hard_idx, n_cand_attr).float()
-        obj_target = F.one_hot(obj_hard_idx, n_cand_obj).float()
-        commitment_loss = (
-            F.mse_loss(F.softmax(attr_logits, dim=-1), attr_target.detach())
-            + F.mse_loss(F.softmax(obj_logits, dim=-1), obj_target.detach())
-        ) / 2.0
-
-        return (
-            resolved_X_attr, resolved_X_obj,
-            resolved_P_attr, resolved_P_obj,
-            attr_hard_idx, obj_hard_idx,
-            attr_log_probs, obj_log_probs,
-            commitment_loss,
-        )
+        return {
+            "resolved_X_attr": resolved_X_attr,
+            "resolved_X_obj": resolved_X_obj,
+            "resolved_P_attr": resolved_P_attr,
+            "resolved_P_obj": resolved_P_obj,
+            "proposal_X_attr": raw_X_attr,
+            "proposal_X_obj": raw_X_obj,
+            "proposal_P_attr": raw_P_attr,
+            "proposal_P_obj": raw_P_obj,
+            "attr_assign_idx": attr_hard_idx,
+            "obj_assign_idx": obj_hard_idx,
+            "commitment_loss": commitment_loss,
+            "proposal_norm_loss": proposal_norm_loss,
+            "attr_scores": attr_scores,
+            "obj_scores": obj_scores,
+        }
 
     # ------------------------------------------------------------------ #
     #  Utilities
@@ -657,8 +833,9 @@ class MemoryConceptEncoder(nn.Module):
         return self._obj_candidate_subsets
 
     def get_slot_memory_padded(self, slot_idx):
-        """Return memory entries for one slot, padded to ambient_dim."""
+        """Return memory entries for one slot, L2-normalized and padded to ambient_dim."""
         memory = self.attr_memory[slot_idx]
+        memory = F.normalize(memory, p=2, dim=-1)
         d = self.dims_per_slot[slot_idx]
         offset_before = sum(self.dims_per_slot[:slot_idx])
         offset_after = self.ambient_dim - offset_before - d

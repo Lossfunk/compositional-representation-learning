@@ -1,0 +1,121 @@
+## exp_137: Margin Topological Sort replacing attr_sink + proportionality
+## Base: exp_135 (refreshed baseline)
+## Change: Remove attr_sink, loss_attr_card_inv_prop, loss_obj_card_prop,
+##         loss_attr_obj_inv_prop. Add margin_topological_sort_loss=10.0.
+## MTS formula: For each pair (i,j), compute asymmetric inclusion
+##   S_ij = ReLU(incl(i in j) - incl(j in i)).
+##   If S_ij > 0.1: enforce rank(j) - rank(i) >= margin * S_ij
+##   Loss = mean(ReLU(margin * S - rank_gap)) over qualifying pairs.
+## Hypothesis: MTS derives rank ordering directly from the subspace inclusion
+## structure rather than from cardinality. This is more principled because:
+##   1. It uses actual lattice relationships, not statistical proxies
+##   2. It naturally handles concept maximality (cross pairs have attr_rank~0
+##      so they're below singletons in inclusion)
+##   3. It creates per-pair constraints, not batch-level correlations
+## Risk: Early in training, all subspaces are near-degenerate → inclusions are
+## all ~1.0 bidirectionally → no asymmetry → no signal. May need warm-up or
+## complementary loss for initial differentiation.
+model:
+  type: SubspaceConceptLattice
+  config:
+    embed_dim: 128
+    ambient_dim: 8
+    n_obj: 4
+    n_attr: 2
+    image_size: 64
+    image_channels: 3
+    lbd: 0.05
+    max_combinations_per_cardinality: 10
+    intersection_power_steps: 5
+    intersection_consistency_only_pairs: false
+    attr_orthogonality_avg_first: false
+    attr_force_orthogonal_basis: true
+    global_galois_loss_start_epoch: 0
+    subspace_gumbel_sigmoid: false
+    binary_intersection: false
+    binary_inclusion: false
+    basis_orthogonality_loss_type:
+    - rank
+    basis_orthogonality_rank_target: 2.0
+    ic_mode: "mse"
+    uc_mode: "bounds"
+    margin_topological_sort_margin: 0.5
+    galois_cycle_weight_mode: temperature
+    galois_cycle_threshold: 0.6
+    galois_cycle_tau: 0.1
+    perceptual_encoder:
+      type: ViTEncoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    concept_encoder:
+      type: ConceptEncoder
+      config:
+        mapping_type: mlp
+        heads: 8
+        clamp_X: false
+    decoder:
+      type: ViTDecoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    loss_weights:
+      reconstruction_loss: 1.0
+      singleton_obj_rank_loss: 1.0
+      max_singleton_attr_rank_loss: 10.0
+      modular_subspace_loss: 0.0
+      attr_orthogonality_loss: 0.0
+      attr_polarization_loss: 0.0
+      concept_similarity_loss: 0.0
+      union_consistency_loss: 1.0
+      intersection_consistency_loss: 10.0
+      attr_sink_loss: 0.0
+      galois_attr_loss: 10.0
+      galois_obj_loss: 1.0
+      global_galois_loss: 0.0
+      basis_orthogonality_loss: 1.0
+      basis_sparsity_loss: 0.0
+      loss_obj_card_prop: 0.0
+      loss_attr_card_inv_prop: 0.0
+      loss_attr_obj_inv_prop: 0.0
+      repulsion_loss_obj: 1.0
+      repulsion_loss_attr: 1.0
+      residual_orthogonality_loss: 0.0
+      rank_conservation_loss: 1.0
+      rank_complementarity_loss: 0.0
+      margin_topological_sort_loss: 10.0
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size:
+      - 64
+      - 64
+      shapes:
+      - circle
+      - square
+      colors:
+      - red
+      - blue
+      excluded_combinations: []
+      num_samples: 1000
+      return_metadata: true
+      center_range:
+      - 32
+      - 33
+      size_range:
+      - 20
+      - 21
+    dataloader_config:
+      batch_size: 8
+      shuffle: true
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

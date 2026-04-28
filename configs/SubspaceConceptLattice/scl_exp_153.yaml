@@ -1,0 +1,139 @@
+## exp_153: Scale test — 5x5 (5 shapes, 5 colors) on exp_148 base
+## Base: exp_148 (cross-slot decorrelation = 10, 1x structural weights)
+## Changes from exp_148:
+##   - n_obj: 4 → 25 (5 colors × 5 shapes)
+##   - ambient_dim: 4 → 10 (5 dims per slot for 5 fillers)
+##   - basis_orthogonality_rank_target: 2.0 → 5.0 (5 fillers per slot)
+##   - shapes: [circle, square] → [circle, square, triangle, pentagon, star]
+##   - colors: [red, blue] → [red, blue, green, yellow, cyan]
+##   - batch_size: 8 → 16 (better singleton coverage per batch)
+##   - num_samples: 1000 → 5000 (more diverse training)
+##   - max_epochs: 100 → 200 (more concepts to learn)
+##   - RC loss DISABLED: rc = attr/n_attr + obj/n_obj = 1.0 only holds for
+##     balanced lattices. With n_obj=25, color concept (attr=1, obj=5) gives
+##     rc=0.70 not 1.0. RC would push obj ranks to impossible values.
+##   - Balance targets now adaptive: p_target=1/F (attr) and 1/n_obj (obj),
+##     computed from rank_target and n_obj respectively (code change, not config).
+##     With F=5: attr balance targets p=0.2; obj balance targets p=0.04.
+## Hypothesis: If the factorization mechanism (decorrelation + IC MSE + bimodal ortho)
+##   generalizes, we should see 2-slot factorization with 5 distinct directions per slot
+##   and correct lattice structure for 25 singletons + 10 intermediate concepts.
+model:
+  type: SubspaceConceptLattice
+  config:
+    embed_dim: 128
+    ambient_dim: 10
+    n_obj: 25
+    n_attr: 2
+    image_size: 64
+    image_channels: 3
+    lbd: 0.05
+    max_combinations_per_cardinality: 10
+    intersection_power_steps: 5
+    intersection_consistency_only_pairs: false
+    attr_orthogonality_avg_first: false
+    attr_force_orthogonal_basis: true
+    global_galois_loss_start_epoch: 0
+    subspace_gumbel_sigmoid: false
+    binary_intersection: false
+    binary_inclusion: false
+    basis_orthogonality_loss_type:
+    - rank
+    - bimodal
+    - balance
+    balance_weight: 20.0
+    obj_subspace_orthogonality_mode: "bimodal"
+    obj_ortho_balance_weight: 20.0
+    basis_orthogonality_rank_target: 5.0
+    ic_mode: "mse"
+    uc_mode: "bounds"
+    margin_topological_sort_margin: 0.5
+    galois_cycle_weight_mode: temperature
+    galois_cycle_threshold: 0.6
+    galois_cycle_tau: 0.1
+    perceptual_encoder:
+      type: ViTEncoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    concept_encoder:
+      type: ConceptEncoder
+      config:
+        mapping_type: mlp
+        heads: 8
+        clamp_X: false
+    decoder:
+      type: ViTDecoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    loss_weights:
+      reconstruction_loss: 1.0
+      singleton_obj_rank_loss: 1.0
+      max_singleton_attr_rank_loss: 1.0
+      modular_subspace_loss: 0.0
+      attr_orthogonality_loss: 0.0
+      attr_polarization_loss: 0.0
+      concept_similarity_loss: 0.0
+      union_consistency_loss: 1.0
+      intersection_consistency_loss: 1.0
+      attr_sink_loss: 1.0
+      galois_attr_loss: 1.0
+      galois_obj_loss: 1.0
+      global_galois_loss: 0.0
+      basis_orthogonality_loss: 1.0
+      obj_subspace_orthogonality_loss: 1.0
+      basis_sparsity_loss: 0.0
+      loss_obj_card_prop: 0.0
+      loss_attr_card_inv_prop: 0.0
+      loss_attr_obj_inv_prop: 0.0
+      repulsion_loss_obj: 0.0
+      repulsion_loss_attr: 0.0
+      residual_orthogonality_loss: 0.0
+      rank_conservation_loss: 0.0
+      attr_obj_orthogonality_loss: 1.0
+      rank_complementarity_loss: 0.0
+      margin_topological_sort_loss: 1.0
+      cross_slot_decorrelation_loss: 10.0
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size:
+      - 64
+      - 64
+      shapes:
+      - circle
+      - square
+      - triangle
+      - pentagon
+      - star
+      colors:
+      - red
+      - blue
+      - green
+      - yellow
+      - cyan
+      excluded_combinations: []
+      num_samples: 5000
+      return_metadata: true
+      center_range:
+      - 32
+      - 33
+      size_range:
+      - 20
+      - 21
+    dataloader_config:
+      batch_size: 16
+      shuffle: true
+      num_workers: 3
+trainer:
+  max_epochs: 200
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001

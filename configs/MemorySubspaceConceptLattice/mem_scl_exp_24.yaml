@@ -1,0 +1,103 @@
+# exp_24: per-slot attention depth=2 + BOTH cosine AND inclusion repulsion
+# Tests whether combining both repulsion types is synergistic.
+model:
+  type: MemorySubspaceConceptLattice
+  config:
+    embed_dim: 128
+    ambient_dim: 8
+    n_attr: 2
+    n_obj: 4
+    image_size: 64
+    image_channels: 3
+    lbd: 0.05
+    fillers_per_slot:
+    - 2
+    - 2
+    max_combinations_per_cardinality: 10
+    resolution_method: gumbel_softmax
+    resolution_tau: 1.0
+    utilization_mode: soft
+    utilization_tau: 0.1
+    per_slot_attention: true
+    slot_attention_depth: 2
+    perceptual_encoder:
+      type: ViTEncoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    concept_encoder:
+      config:
+        heads: 8
+    decoder:
+      type: ViTDecoder
+      config:
+        patch_size: 8
+        depth: 4
+        heads: 8
+        mlp_ratio: 4.0
+    loss_weights:
+      reconstruction_loss: 1.0
+      commitment_loss: 1.0
+      memory_slot_orthogonality_loss: 1.0
+      memory_obj_rank_loss: 1.0
+      memory_obj_orthogonality_loss: 1.0
+      max_singleton_attr_rank_loss: 1.0
+      galois_attr_loss: 1.0
+      galois_obj_loss: 1.0
+      intersection_consistency_loss: 1.0
+      union_consistency_loss: 1.0
+      attr_sink_loss: 1.0
+      loss_attr_obj_inv_prop: 1.0
+      repulsion_loss_attr: 1.0
+      repulsion_loss_obj: 1.0
+      cosine_repulsion_loss_attr: 1.0
+      cosine_repulsion_loss_obj: 1.0
+      utilization_loss_attr: 1.0
+      utilization_loss_obj: 1.0
+      proposal_norm_loss: 0.0
+    loss_targets:
+      max_singleton_attr_rank_loss: proposal
+      repulsion_loss_attr: proposal
+      repulsion_loss_obj: proposal
+      cosine_repulsion_loss_attr: proposal
+      cosine_repulsion_loss_obj: proposal
+      galois_attr_loss: proposal
+      galois_obj_loss: proposal
+      intersection_consistency_loss: proposal
+      union_consistency_loss: proposal
+      attr_sink_loss: proposal
+      loss_attr_obj_inv_prop: proposal
+data:
+  train:
+    type: v0Dataset
+    config:
+      image_size:
+      - 64
+      - 64
+      shapes:
+      - circle
+      - square
+      colors:
+      - red
+      - blue
+      excluded_combinations: []
+      num_samples: 1000
+      return_metadata: true
+      center_range:
+      - 32
+      - 33
+      size_range:
+      - 20
+      - 21
+    dataloader_config:
+      batch_size: 8
+      shuffle: true
+      num_workers: 4
+trainer:
+  max_epochs: 100
+  optimizer:
+    type: Adam
+    config:
+      lr: 0.0001
